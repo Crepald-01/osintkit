@@ -140,7 +140,7 @@ def banner():
         return
     for i, l in enumerate(BANNER.strip("\n").splitlines()):
         _print(f"\033[1;38;5;{[51, 45, 39, 33, 27][i % 5]}m{l}\033[0m")
-    _print(c("2", " 10 tools · public data only · use on assets you own or are authorized to assess\n"))
+    _print(c("2", " 13 tools · public data only · use on assets you own or are authorized to assess\n"))
 
 
 def http(url, headers=None, data=None, method=None, js=False, raw=False, timeout=30):
@@ -170,7 +170,7 @@ def need(var):
 
 
 def h1(t):
-    _print("\n" + (c("1;36", f"━━ {t} " + "━" * max(2, 60 - len(t))) if COLOR else f"=== {t} ==="))
+    _print("\n" + (c("1;36", f"── {t} " + "─" * max(2, 60 - len(t))) if COLOR else f"=== {t} ==="))
 
 
 def strip_html(s):

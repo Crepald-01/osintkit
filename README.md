@@ -2,6 +2,15 @@
 
 A stdlib-only Python CLI bundling 13 open-source-intelligence tools, with a colored interactive menu.
 
+![osintkit demo](docs/demo.gif)
+
+<p>
+  <img src="docs/menu.png" alt="Interactive menu" width="48%">
+  <img src="docs/screenshot.png" alt="Email header analysis" width="48%">
+</p>
+
+## Quick start
+
 ```
 python osintkit.py          # interactive menu
 python osintkit.py -h       # all commands
