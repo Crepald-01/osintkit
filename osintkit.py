@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""osintkit - ten defensive/research OSINT tools in one stdlib-only CLI.
+"""osintkit - 19 defensive/research OSINT tools in one stdlib-only CLI.
 
   headers   analyze raw email headers (relay path, SPF/DKIM/DMARC, spoof flags)
   company   company registries (SEC EDGAR, Companies House, OpenCorporates)
@@ -15,7 +15,12 @@
   domain    domain recon: DNS, SPF/DMARC, RDAP age, security headers, subdomains
   typosquat find registered lookalike domains of your brand
   username  check where a username exists across ~28 sites
-  setup     enter and save API keys
+  exposure  open ports + known CVEs for an IP/domain (Shodan InternetDB)
+  cve       CVE severity, exploited-in-the-wild (CISA KEV), EPSS
+  tls       TLS certificate inspector + related names
+  exif      photo metadata and embedded GPS
+  ip        IP location, network owner, Tor-exit check
+  setup     guided API key setup
   doctor    show which API keys are configured
 
 Use only on public data, your own assets, or with authorization.
@@ -140,7 +145,7 @@ def banner():
         return
     for i, l in enumerate(BANNER.strip("\n").splitlines()):
         _print(f"\033[1;38;5;{[51, 45, 39, 33, 27][i % 5]}m{l}\033[0m")
-    _print(c("2", " 13 tools · public data only · use on assets you own or are authorized to assess\n"))
+    _print(c("2", f" {len(MENU) - 2} tools · public data only · use on assets you own or are authorized to assess\n"))
 
 
 def http(url, headers=None, data=None, method=None, js=False, raw=False, timeout=30):
@@ -286,7 +291,8 @@ def cmd_headers(a):
         for f in flags:
             print(" [!]", f)
         score = len(flags)
-        print(f"\n Risk: {'HIGH' if score >= 4 else 'MEDIUM' if score >= 2 else 'LOW'} ({score} indicator(s))")
+        lvl = "HIGH" if score >= 4 else "MEDIUM" if score >= 2 else "LOW"
+        panel("Spoofing risk", [f"{lvl} - {score} indicator(s) found"], "31" if lvl == "HIGH" else "33" if lvl == "MEDIUM" else "32")
 
 
 # ---------------------------------------------------------------- 12 company
@@ -707,10 +713,11 @@ def cmd_ioc(a):
     bad = sum(s[1] == "bad" for s in signals)
     warn = sum(s[1] == "warn" for s in signals)
     if not signals:
-        print(" UNKNOWN - no source answered (configure API keys: osintkit doctor)")
+        panel("IOC verdict", ["UNKNOWN - no source answered", "add API keys: osintkit setup --only ioc"], "33")
     else:
-        print(f" {'MALICIOUS' if bad else 'SUSPICIOUS' if warn else 'NO KNOWN BAD'} "
-              f"({bad} bad, {warn} warn, {len(signals)} sources answered)")
+        panel("IOC verdict", [f"{'MALICIOUS' if bad else 'SUSPICIOUS' if warn else 'NO KNOWN BAD'}",
+                              f"{bad} bad, {warn} warn, {len(signals)} source(s) answered"],
+              "31" if bad else "33" if warn else "32")
 
 
 # ---------------------------------------------------------------- 19 brand
@@ -909,7 +916,11 @@ def cmd_typosquat(a):
 
     def probe(c_):
         ips = doh(c_, "A")
-        return c_, ips, bool(doh(c_, "MX")) if ips else False
+        out = c_, ips, bool(doh(c_, "MX")) if ips else False
+        prog.tick()
+        return out
+
+    prog = Progress(len(cands), "resolving variants")
 
     NOSPIN = True
     try:
@@ -917,6 +928,7 @@ def cmd_typosquat(a):
             res = [r for r in ex.map(probe, cands) if r[1]]
     finally:
         NOSPIN = False
+        prog.done()
     h1(f"{len(res)} lookalike(s) resolve")
     for dom, ips, mx in res:
         print(f" {dom:32} {', '.join(ips[:2]):32} {'[!] has MX (can send/receive mail)' if mx else ''}")
@@ -976,7 +988,10 @@ def cmd_username(a):
             code = 404
         if s_[0] == "Hacker News" and code == 200 and body.strip() == "null":
             code = 404
+        prog.tick()
         return s_[0], s_[1].format(u), code
+
+    prog = Progress(len(SITES), "checking sites")
 
     NOSPIN = True
     try:
@@ -984,6 +999,7 @@ def cmd_username(a):
             res = list(ex.map(probe, SITES))
     finally:
         NOSPIN = False
+        prog.done()
     found = [r for r in res if r[2] == 200]
     unk = [r for r in res if r[2] not in (200, 404)]
     h1(f"{len(found)} profile(s) found for '{u}'")
@@ -1025,7 +1041,8 @@ REQUIRED = {  # keys a tool needs to be fully "ready" (each tool also has a keyl
     "brand": ["HIBP_KEY", "GITHUB_TOKEN"],
     "factcheck": ["GOOGLE_API_KEY"],
 }
-KEYLESS = ["headers", "wayback", "fly", "vessel", "sat", "monitor", "meta", "domain", "typosquat", "username"]
+KEYLESS = ["headers", "wayback", "fly", "vessel", "sat", "monitor", "meta", "domain", "typosquat", "username",
+           "exposure", "cve", "tls", "exif", "ip"]
 
 _TESTS = {  # one cheap authenticated call per service
     "VT_API_KEY": lambda v: http("https://www.virustotal.com/api/v3/ip_addresses/8.8.8.8", {"x-apikey": v}, js=True),
@@ -1076,6 +1093,9 @@ def _load_keys():
 
 def _save_keys(saved):
     os.makedirs(os.path.dirname(KEYFILE), exist_ok=True)
+    if os.path.exists(KEYFILE):  # keep the previous version so a bad save is never destructive
+        import shutil
+        shutil.copy2(KEYFILE, KEYFILE + ".bak")
     json.dump(saved, open(KEYFILE, "w"), indent=2)
     os.environ.update(saved)  # take effect immediately in this process
 
@@ -1216,36 +1236,470 @@ def first_run():
         print(c("2", " No problem - 10 tools work without keys. Run 'setup' from the menu any time.\n"))
 
 
+# ---------------------------------------------------------------- UI helpers
+import shlex, socket, ssl, struct, textwrap
+
+ANSI_RE = re.compile(r"\033\[[\d;]*m")
+
+
+class _Tee:
+    """stdout wrapper for --save: mirrors output to a file with colors stripped."""
+
+    def __init__(self, real, f):
+        self.real, self.f, self.encoding = real, f, getattr(real, "encoding", "utf-8")
+
+    def write(self, s):
+        self.real.write(s)
+        self.f.write(ANSI_RE.sub("", s))
+        return len(s)
+
+    def flush(self):
+        self.real.flush()
+        self.f.flush()
+
+    def isatty(self):
+        return self.real.isatty()
+
+
+def panel(title, lines, color="36"):
+    """Boxed summary. lines are plain strings."""
+    if not COLOR:
+        _print(f"\n[{title}]")
+        for l in lines:
+            _print("  " + l)
+        return
+    inner = max([len(title) + 4] + [len(l) + 2 for l in lines])
+    _print("\n" + c(color, "┌─ ") + c("1;" + color, title) + c(color, " " + "─" * (inner - len(title) - 3) + "┐"))
+    for l in lines:
+        _print(c(color, "│ ") + l.ljust(inner - 2) + c(color, " │"))
+    _print(c(color, "└" + "─" * inner + "┘"))
+
+
+class Progress:
+    def __init__(self, total, label):
+        self.t, self.n, self.label = max(total, 1), 0, label
+        self.on = sys.stderr.isatty() and not os.environ.get("NO_COLOR")
+
+    def tick(self):
+        self.n += 1
+        if self.on:
+            f = int(24 * self.n / self.t)
+            sys.stderr.write(f"\r\033[36m{'█' * f}{'░' * (24 - f)}\033[0m {self.n}/{self.t} \033[2m{self.label}\033[0m\033[K")
+            sys.stderr.flush()
+
+    def done(self):
+        if self.on:
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+
+
+def cached(url, name, ttl=43200, js=False):
+    """Download big public lists once and reuse them for `ttl` seconds."""
+    path = os.path.join(STATE, name)
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < ttl:
+        txt = open(path, encoding="utf8").read()
+    else:
+        txt = http(url, timeout=90)
+        os.makedirs(STATE, exist_ok=True)
+        open(path, "w", encoding="utf8").write(txt)
+    return json.loads(txt) if js else txt
+
+
+def _is_ip(s):
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _host(s):
+    return re.sub(r"^https?://", "", s.strip()).split("/")[0]
+
+
+# ---------------------------------------------------------------- 24 exposure
+RISKY = {21: "FTP", 23: "Telnet", 445: "SMB", 1433: "MSSQL", 2375: "Docker API", 3306: "MySQL", 3389: "RDP",
+         5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 9200: "Elasticsearch", 11211: "Memcached", 27017: "MongoDB"}
+PORTS = {22: "SSH", 25: "SMTP", 53: "DNS", 80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS", 465: "SMTPS",
+         587: "SMTP", 993: "IMAPS", 995: "POP3S", 8080: "HTTP-alt", 8443: "HTTPS-alt"}
+
+
+def cmd_exposure(a):
+    t = _host(a.target)
+    ips = [t] if _is_ip(t) else (doh(t, "A") or [])
+    if not ips:
+        raise Err(f"could not resolve {t}")
+    for ip in ips[:4]:
+        h1(ip + ("" if ip == t else f"  ({t})"))
+        try:
+            r = http(f"https://internetdb.shodan.io/{ip}", js=True)
+        except Err as e:
+            if "404" in str(e):
+                print(" no exposure data - nothing known to be listening (good)")
+                continue
+            raise
+        ports, vulns = sorted(r.get("ports", [])), sorted(r.get("vulns", []))
+        risky = [p for p in ports if p in RISKY]
+        for p in ports:
+            name = RISKY.get(p) or PORTS.get(p) or ""
+            print(f" {p:<6} {name}" + (f"   [!] {name} should not be internet-facing" if p in RISKY else ""))
+        if r.get("hostnames"):
+            print(f"\n hostnames: {', '.join(r['hostnames'][:8])}")
+        if r.get("tags"):
+            print(f" tags:      {', '.join(r['tags'])}")
+        if r.get("cpes"):
+            print(f" software:  {', '.join(r['cpes'][:8])}")
+        if vulns:
+            print(f"\n known CVEs ({len(vulns)}):")
+            for v in vulns[: a.max]:
+                print(f"   [!] {v}")
+            print(c("2", f"   details: osintkit cve {vulns[0]}"))
+        panel("Exposure", [f"{len(ports)} open port(s), {len(risky)} risky, {len(vulns)} known CVE(s)",
+                           "passive snapshot (updated about weekly), not a live scan"],
+              "31" if risky or vulns else "32")
+
+
+# ---------------------------------------------------------------- 25 cve
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+
+
+def cmd_cve(a):
+    kev = None
+    for cid in a.ids:
+        cid = cid.upper()
+        h1(cid)
+        if not re.fullmatch(r"CVE-\d{4}-\d{4,}", cid):
+            print(" not a valid CVE id (format: CVE-2021-44228)")
+            continue
+        vs = http(f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cid}", js=True, timeout=40).get("vulnerabilities")
+        if not vs:
+            print(" not found in the NVD")
+            continue
+        cve = vs[0]["cve"]
+        desc = next((d["value"] for d in cve["descriptions"] if d["lang"] == "en"), "")
+        score = sev = vector = None
+        for k in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+            if cve.get("metrics", {}).get(k):
+                m = cve["metrics"][k][0]
+                score, vector = m["cvssData"].get("baseScore"), m["cvssData"].get("vectorString")
+                sev = m["cvssData"].get("baseSeverity") or m.get("baseSeverity")
+                break
+        if kev is None:
+            try:
+                kev = {x["cveID"]: x for x in cached(KEV_URL, "kev.json", js=True)["vulnerabilities"]}
+            except Err:
+                kev = {}
+        epss = pct = None
+        try:
+            e = http(f"https://api.first.org/data/v1/epss?cve={cid}", js=True).get("data")
+            if e:
+                epss, pct = float(e[0]["epss"]), float(e[0]["percentile"])
+        except (Err, ValueError, KeyError):
+            pass
+        for line in textwrap.wrap(desc, 96):
+            print(" " + line)
+        print(f"\n CVSS:      {score if score is not None else 'n/a'} {sev or ''}   {vector or ''}")
+        print(f" EPSS:      {f'{epss*100:.1f}% chance of exploitation in 30 days (top {max(100 - pct * 100, 0.1):.1f}% most likely)' if epss is not None else 'n/a'}")
+        print(f" published: {cve.get('published', '')[:10]}   weaknesses: "
+              f"{', '.join(d['value'] for w in cve.get('weaknesses', []) for d in w['description']) or '-'}")
+        if cid in kev:
+            k = kev[cid]
+            print(f" [!] CISA KEV: exploited in the wild. Added {k['dateAdded']}, fix due {k['dueDate']}.")
+        for r in cve.get("references", [])[:4]:
+            print(c("2", f"   {r['url']}"))
+        if cid in kev:
+            pri, col = "PATCH NOW - actively exploited in the wild", "31"
+        elif (epss or 0) >= 0.1 or (score or 0) >= 9:
+            pri, col = "HIGH priority - severe or likely to be exploited", "33"
+        elif (score or 0) >= 7:
+            pri, col = "MEDIUM priority - schedule a fix", "33"
+        else:
+            pri, col = "LOW priority", "32"
+        panel("Patch priority", [pri], col)
+
+
+# ---------------------------------------------------------------- 26 tls
+def cmd_tls(a):
+    host, _, port = _host(a.host).partition(":")
+    port = int(port or 443)
+    cert = err = None
+
+    def connect(ctx):
+        with socket.create_connection((host, port), timeout=10) as s, ctx.wrap_socket(s, server_hostname=host) as ss:
+            return ss.getpeercert(), ss.version(), ss.cipher()
+
+    try:
+        with Spinner(f"handshaking with {host}:{port}"):
+            cert, proto, cipher = connect(ssl.create_default_context())
+    except ssl.SSLCertVerificationError as e:
+        err = e.verify_message
+        ctx = ssl.create_default_context()
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+        try:
+            _, proto, cipher = connect(ctx)
+        except OSError as e2:
+            raise Err(f"connection failed: {e2}")
+    except (OSError, ssl.SSLError) as e:
+        raise Err(f"could not connect to {host}:{port}: {e}")
+    h1(f"TLS certificate for {host}:{port}")
+    print(f" protocol: {proto}   cipher: {cipher[0]} ({cipher[2]} bit)")
+    flags = []
+    if err:
+        flags.append(f"certificate NOT trusted: {err}")
+        print(c("1;31", f" [!] certificate not trusted: {err}"))
+    if cert:
+        sub, iss = (dict(x[0] for x in cert[k]) for k in ("subject", "issuer"))
+        end = ssl.cert_time_to_seconds(cert["notAfter"])
+        days = int((end - time.time()) / 86400)
+        sans = [v for k, v in cert.get("subjectAltName", ()) if k == "DNS"]
+        print(f" subject:  {sub.get('commonName', '-')}   org: {sub.get('organizationName', '-')}")
+        print(f" issuer:   {iss.get('commonName', '-')} ({iss.get('organizationName', '-')})")
+        print(f" valid:    {time.strftime('%Y-%m-%d', time.gmtime(ssl.cert_time_to_seconds(cert['notBefore'])))} -> "
+              f"{time.strftime('%Y-%m-%d', time.gmtime(end))}  ({days} days left)")
+        print(f" serial:   {cert.get('serialNumber')}")
+        if days < 0:
+            flags.append(f"certificate EXPIRED {-days} days ago")
+        elif days < 21:
+            flags.append(f"certificate expires in {days} days")
+        if sub == iss:
+            flags.append("self-signed certificate")
+        others = [s for s in sans if s != host]
+        h1(f"{len(sans)} name(s) on this certificate (often sibling sites of the same owner)")
+        for s in sans[:40]:
+            print("   " + s)
+        if len(sans) > 40:
+            print(c("2", f"   ... and {len(sans) - 40} more"))
+        if any(s.startswith("*.") for s in sans):
+            print(c("2", " note: includes a wildcard, so any subdomain can share this certificate"))
+    if proto in ("TLSv1", "TLSv1.1"):
+        flags.append(f"outdated protocol {proto}")
+    panel("TLS verdict", flags or ["certificate valid and trusted, modern protocol"], "31" if flags else "32")
+
+
+# ---------------------------------------------------------------- 27 exif
+def _tiff(t):
+    e = "<" if t[:2] == b"II" else ">"
+    u = lambda f, o: struct.unpack_from(e + f, t, o)
+    SZ = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8}
+
+    def ifd(off):
+        out = {}
+        try:
+            for k in range(u("H", off)[0]):
+                o = off + 2 + 12 * k
+                tag, typ, cnt = u("HHI", o)
+                size = SZ.get(typ, 1) * cnt
+                vo = o + 8 if size <= 4 else u("I", o + 8)[0]
+                if typ == 2:
+                    v = t[vo:vo + cnt].split(b"\0")[0].decode("latin1").strip()
+                elif typ == 3:
+                    v = list(u(f"{cnt}H", vo))
+                elif typ == 4:
+                    v = list(u(f"{cnt}I", vo))
+                elif typ in (5, 10):
+                    n = u(f"{2 * cnt}{'I' if typ == 5 else 'i'}", vo)
+                    v = [n[i] / n[i + 1] if n[i + 1] else 0 for i in range(0, len(n), 2)]
+                elif typ in (1, 7):
+                    v = t[vo:vo + cnt]
+                else:
+                    continue
+                out[tag] = v[0] if isinstance(v, list) and len(v) == 1 else v
+        except struct.error:
+            pass
+        return out
+
+    d = {"ifd0": ifd(u("I", 4)[0])}
+    for name, tag in (("exif", 0x8769), ("gps", 0x8825)):
+        if isinstance(d["ifd0"].get(tag), int):
+            d[name] = ifd(d["ifd0"][tag])
+    return d
+
+
+def _exif(data):
+    if data[:2] != b"\xff\xd8":
+        return None
+    i = 2
+    while i + 4 <= len(data) and data[i] == 0xFF and data[i + 1] != 0xDA:
+        ln = struct.unpack(">H", data[i + 2:i + 4])[0]
+        if data[i + 1] == 0xE1 and data[i + 4:i + 10] == b"Exif\0\0":
+            return _tiff(data[i + 10:i + 2 + ln])
+        i += 2 + ln
+    return {}
+
+
+def _deg(v, ref):
+    if not isinstance(v, list) or len(v) != 3:
+        return None
+    d = v[0] + v[1] / 60 + v[2] / 3600
+    return -d if ref in ("S", "W") else d
+
+
+def cmd_exif(a):
+    files = []
+    for t in a.paths:
+        if re.match(r"https?://", t):
+            files.append((t, http(t, raw=True, timeout=60)))
+        elif os.path.isdir(t):
+            for r, _, fs in os.walk(t):
+                files += [(os.path.join(r, f), open(os.path.join(r, f), "rb").read())
+                          for f in fs if f.lower().endswith((".jpg", ".jpeg"))]
+        else:
+            files.append((t, open(t, "rb").read()))
+    leaks = 0
+    for name, data in files:
+        h1(name)
+        hit = False
+        d = _exif(data)
+        if d is None:
+            print(" not a JPEG (EXIF is read from JPEG photos)")
+            continue
+        if not d:
+            print(" no EXIF metadata (stripped, or a screenshot/edited export)")
+            continue
+        i0, ex, gps = d.get("ifd0", {}), d.get("exif", {}), d.get("gps", {})
+        for label, val in (("Camera", " ".join(x for x in (i0.get(0x010F), i0.get(0x0110)) if x)),
+                           ("Lens", ex.get(0xA434)), ("Software", i0.get(0x0131)),
+                           ("Taken", ex.get(0x9003) or i0.get(0x0132)), ("Owner/Artist", ex.get(0xA430) or i0.get(0x013B)),
+                           ("Copyright", i0.get(0x8298)), ("Body serial", ex.get(0xA431))):
+            if val:
+                print(f" {label + ':':13} {val}")
+        if ex.get(0xA431) or ex.get(0xA430):
+            print(" [!] contains a camera serial number / owner name that can identify the device or person")
+            hit = True
+        lat, lon = _deg(gps.get(2), gps.get(1)), _deg(gps.get(4), gps.get(3))
+        if lat is not None and lon is not None:
+            leaks += 1
+            print(f"\n [!] GPS location embedded: {lat:.6f}, {lon:.6f}")
+            if isinstance(gps.get(6), (int, float)):
+                print(f"     altitude: {gps[6]:.0f} m")
+            print(f"     https://www.google.com/maps?q={lat:.6f},{lon:.6f}")
+            print(f"     https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lon:.6f}#map=17/{lat:.6f}/{lon:.6f}")
+        else:
+            print("\n no GPS coordinates in this file")
+    if files:
+        panel("Metadata summary", [f"{len(files)} image(s) checked, {leaks} with identifying data",
+                                   "tip: strip with `exiftool -all= photo.jpg` before sharing"], "33" if leaks else "32")
+
+
+# ---------------------------------------------------------------- 28 ip
+def _abuse_email(ents):
+    for e in ents or []:
+        if "abuse" in e.get("roles", []):
+            for i in e.get("vcardArray", [0, []])[1]:
+                if i[0] == "email":
+                    return i[3]
+        r = _abuse_email(e.get("entities"))
+        if r:
+            return r
+
+
+def cmd_ip(a):
+    t = _host(a.target)
+    ip = t if _is_ip(t) else next(iter(doh(t, "A") or []), None)
+    if not ip:
+        raise Err(f"could not resolve {t}")
+    obj = ipaddress.ip_address(ip)
+    if obj.is_private or obj.is_loopback or obj.is_reserved or obj.is_link_local:
+        raise Err(f"{ip} is a private/reserved address - no public intel exists for it")
+    h1(f"{ip}" + ("" if ip == t else f"  ({t})"))
+    notes = []
+    try:
+        g = http(f"https://ipwho.is/{ip}", js=True)
+        if g.get("success"):
+            cn = g.get("connection", {})
+            print(f" location: {g.get('city')}, {g.get('region')}, {g.get('country')}  ({g.get('latitude')}, {g.get('longitude')})")
+            print(f" network:  AS{cn.get('asn')} {cn.get('org')}  (ISP: {cn.get('isp')})")
+            print(f" timezone: {g.get('timezone', {}).get('id')}")
+            print(c("2", " note: IP geolocation is city-level at best and wrong for VPNs/CDNs"))
+    except Err as e:
+        print(f" geolocation skipped: {e}")
+    try:
+        r = http(f"https://dns.google/resolve?name={obj.reverse_pointer}&type=PTR", js=True, timeout=10)
+        ptr = [x["data"] for x in r.get("Answer", []) if x.get("type") == 12]
+        print(f" reverse DNS: {', '.join(ptr) or 'none'}")
+    except Err:
+        pass
+    try:
+        r = http(f"https://rdap.org/ip/{ip}", js=True, timeout=30)
+        print(f"\n registered block: {r.get('startAddress')} - {r.get('endAddress')}  ({r.get('name')}, {r.get('country', '?')})")
+        ab = _abuse_email(r.get("entities"))
+        if ab:
+            print(f" abuse contact:    {ab}")
+    except Err as e:
+        print(f" RDAP skipped: {e}")
+    try:
+        if ip in set(cached("https://check.torproject.org/torbulkexitlist", "tor_exits.txt").split()):
+            notes.append("this IP is a TOR EXIT NODE")
+            print(c("1;31", " [!] Tor exit node: traffic from here is anonymized"))
+    except Err:
+        pass
+    panel("IP summary", notes or ["not a known Tor exit"], "33" if notes else "32")
+    print(c("2", f" next: osintkit exposure {ip}   |   osintkit ioc {ip}"))
+
+
+# ---------------------------------------------------------------- menu / run
 # (command, description, [(prompt, flag or None for positional, default)])
 MENU = [
     ("headers", "Email header analyzer (phishing triage)", [("Header file (blank = paste, then Ctrl+Z/Ctrl+D)", None, "")]),
+    ("username", "Username footprint across sites", [("Username (yours)", None, "")]),
+    ("factcheck", "Claim verification + reverse-image links", [("Claim text", None, ""), ("Image URL for reverse search", "--image", "")]),
+    ("domain", "Domain recon: DNS, email security, WHOIS, subdomains", [("Domain", None, "")]),
+    ("typosquat", "Lookalike / phishing domain hunter", [("Your domain", None, "")]),
+    ("tls", "TLS certificate inspector + related names", [("host[:port]", None, "")]),
+    ("ip", "IP intel: location, ASN, owner, Tor check", [("IP or domain", None, "")]),
+    ("exposure", "Open ports & known CVEs (Shodan InternetDB)", [("IP or domain", None, "")]),
+    ("brand", "Brand exposure monitor (your domain)", [("Your domain", None, "")]),
+    ("ioc", "Threat-intel IOC enricher", [("IP / domain / URL / hash", None, "")]),
+    ("cve", "CVE lookup: severity, exploited-in-wild, EPSS", [("CVE id (e.g. CVE-2021-44228)", None, "")]),
     ("company", "Company registries (SEC / Companies House / OpenCorporates)", [("Company name", None, "")]),
     ("wayback", "Wayback change tracker", [("Page URL", None, "")]),
+    ("meta", "Document metadata extractor", [("File, folder or page URL", None, "")]),
+    ("exif", "Photo metadata & GPS extractor", [("Image file, folder or URL", None, "")]),
     ("fly", "Aircraft tracker (ADS-B)", [("Callsign", "--callsign", ""), ("Hex code", "--hex", ""),
-                                        ("Near lat,lon,radius_nm", "--near", "")]),
+                                         ("Near lat,lon,radius_nm", "--near", "")]),
     ("vessel", "Vessel tracker (AIS, Baltic)", [("MMSI", "--mmsi", ""), ("Near lat,lon,km", "--near", "")]),
     ("sat", "Satellite imagery (search / compare)", [("Action (search|compare)", None, "search"),
                                                      ("Point lat,lon", "--point", ""),
                                                      ("Range start:end (search)", "--range", "2025-01-01:2025-03-01")]),
     ("monitor", "Feed + Telegram keyword monitor", [("RSS/Atom feed URL", "--feed", ""), ("Telegram channel", "--tg", ""),
                                                     ("Keyword", "--kw", "")]),
-    ("meta", "Document metadata extractor", [("File, folder or page URL", None, "")]),
-    ("ioc", "Threat-intel IOC enricher", [("IP / domain / URL / hash", None, "")]),
-    ("brand", "Brand exposure monitor (your domain)", [("Your domain", None, "")]),
-    ("factcheck", "Claim verification", [("Claim text", None, ""), ("Image URL for reverse search", "--image", "")]),
-    ("domain", "Domain recon (DNS, email security, WHOIS, subdomains)", [("Domain", None, "")]),
-    ("typosquat", "Lookalike / phishing domain hunter", [("Your domain", None, "")]),
-    ("username", "Username footprint across sites", [("Username (yours)", None, "")]),
-    ("setup", "Enter and save API keys (guided)", []),
-    ("doctor", "Show configured API keys", []),
+    ("setup", "Guided API key setup", []),
+    ("doctor", "Which tools are ready", []),
 ]
+MENU_BY = {m[0]: m for m in MENU}
+CATS = [
+    ("Email & identity", ["headers", "username", "factcheck"]),
+    ("Domains & network", ["domain", "typosquat", "tls", "ip", "exposure", "brand"]),
+    ("Threat intel", ["ioc", "cve"]),
+    ("Records & media", ["company", "wayback", "meta", "exif"]),
+    ("Tracking & imagery", ["fly", "vessel", "sat"]),
+    ("Monitoring", ["monitor"]),
+    ("Setup", ["setup", "doctor"]),
+]
+ORDER = [cmd for _, cs in CATS for cmd in cs]
 
 
 def run(argv):
+    global COLOR
+    if argv and not argv[0].startswith("-") and argv[0] not in MENU_BY:
+        sug = difflib.get_close_matches(argv[0], ORDER, 1, 0.5)
+        _print(c("1;31", f"unknown command '{argv[0]}'") + (f" - did you mean '{sug[0]}'?" if sug else "")
+               + c("2", "   (osintkit -h lists everything)"))
+        return
     try:
         a = build_parser().parse_args(argv)
     except SystemExit:
         return
+    if a.no_color:
+        COLOR = False
+    real, f = sys.stdout, None
+    if a.save:
+        try:
+            f = open(a.save, "w", encoding="utf8")
+        except OSError as e:
+            _print(c("1;31", f"error: cannot write {a.save}: {e}"))
+            return
+        sys.stdout = _Tee(real, f)
     try:
         a.fn(a)
     except Err as e:
@@ -1254,47 +1708,125 @@ def run(argv):
         _print(c("1;31", "error: this command needs interactive input (no terminal attached)"))
     except KeyboardInterrupt:
         _print()
+    finally:
+        if f:
+            sys.stdout = real
+            f.close()
+            _print(c("2", f"report saved to {a.save}"))
+
+
+def _status(cmd):
+    req = REQUIRED.get(cmd)
+    if not req:
+        return c("32", "●")
+    return c("32", "●") if all(_have(k) for k in req) else c("33", "○")
+
+
+def show_menu():
+    n = 0
+    for title, cmds in CATS:
+        _print("\n " + c("1;35", title.upper()))
+        for cmd in cmds:
+            n += 1
+            _print(f"  {c('1;36', f'{n:>2}')}  {_status(cmd)} {c('1', cmd.ljust(10))} {c('2', MENU_BY[cmd][1])}")
+    _print(c("2", "\n  ● ready   ○ works, more sources with API keys (run: setup)"))
+
+
+def _resolve_cmd(tok):
+    tok = tok.lower()
+    if tok.isdigit() and 1 <= int(tok) <= len(ORDER):
+        return ORDER[int(tok) - 1]
+    if tok in MENU_BY:
+        return tok
+    pref = [x for x in ORDER if x.startswith(tok)]
+    return pref[0] if len(pref) == 1 else None
+
+
+HELP = f""" {c('1', 'How to use')}
+  {c('1;36', 'number or name')}    pick a tool; you'll be asked for its inputs        e.g.  10   or   ioc
+  {c('1;36', 'full command')}      run it in one line                                 e.g.  ioc 8.8.8.8
+  {c('1;36', '?name')}             show that tool's options                           e.g.  ?fly
+  {c('1;36', '!')}                 repeat the last command
+  {c('1;36', 'l')}  list tools   {c('1;36', 'k')}  key status   {c('1;36', 'h')}  this help   {c('1;36', 'q')}  quit
+  {c('2', 'Tip: unique prefixes work (hea = headers). Add --save report.txt to any command to keep the output.')}"""
 
 
 def menu():
     banner()
     first_run()
+    try:
+        import readline
+        readline.set_completer(lambda t, i: ([x for x in ORDER if x.startswith(t)] + [None])[i])
+        readline.parse_and_bind("tab: complete")
+    except Exception:
+        pass
     if not any(_have(k) for k in KEYS):
-        _print(c("2", " tip: pick 'setup' to unlock ioc, factcheck, brand and company (10 tools already work without keys)\n"))
+        _print(c("2", " tip: type 'setup' to unlock more sources in ioc, factcheck, brand and company\n"))
+    show_menu()
+    _print(c("2", "\n  type a number or name  ·  'h' help  ·  'q' quit"))
+    last = None
     while True:
-        for i, (cmd, desc, _) in enumerate(MENU, 1):
-            _print(f" {c('1;36', f'{i:>2}')}  {c('1', cmd.ljust(10))} {c('2', desc)}")
-        _print(f" {c('1;36', ' q')}  quit")
         try:
-            choice = input(c("1;35", "\n osint› ")).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return
-        if choice in ("q", "quit", "exit"):
-            return
-        if not choice.isdigit() or not 1 <= int(choice) <= len(MENU):
-            _print(c("33", " pick a number from the list"))
-            continue
-        cmd, _, prompts = MENU[int(choice) - 1]
-        argv, pos = [cmd], []
-        try:
-            for label, flag, default in prompts:
-                v = input(f"  {label}{c('2', f' [{default}]') if default else ''}: ").strip() or default
-                if v:
-                    (argv.extend if flag else pos.extend)([flag, v] if flag else [v])
+            line = input(c("1;35", "\n osint› ")).strip()
         except (EOFError, KeyboardInterrupt):
             _print()
-            continue
-        # positionals must precede flags for argparse subcommands
-        run([cmd] + pos + argv[1:])
-        try:
-            input(c("2", "\n press Enter to return to menu "))
-        except (EOFError, KeyboardInterrupt):
             return
-        _print()
+        low = line.lower()
+        if not low:
+            continue
+        if low in ("q", "quit", "exit"):
+            return
+        if low in ("h", "help", "?"):
+            _print(HELP)
+            continue
+        if low in ("l", "list", "ls"):
+            show_menu()
+            continue
+        if low in ("k", "keys", "status"):
+            cmd_doctor(None)
+            continue
+        if low == "!":
+            if last:
+                run(last)
+            else:
+                _print(c("33", " nothing to repeat yet"))
+            continue
+        try:
+            parts = [p.strip("\"'") for p in shlex.split(line, posix=(os.name != "nt"))]
+        except ValueError:
+            _print(c("33", " unbalanced quotes"))
+            continue
+        help_only = parts[0].startswith("?")
+        cmd = _resolve_cmd(parts[0].lstrip("?"))
+        if not cmd:
+            sug = difflib.get_close_matches(parts[0].lstrip("?"), ORDER, 1, 0.5)
+            _print(c("33", f" no tool called '{parts[0]}'") + (f" - did you mean '{sug[0]}'?" if sug else "") + c("2", "  ('l' lists tools)"))
+            continue
+        if help_only:
+            run([cmd, "-h"])
+            continue
+        if len(parts) > 1:
+            argv = [cmd] + parts[1:]
+        else:
+            args, pos = [], []
+            try:
+                for label, flag, default in MENU_BY[cmd][2]:
+                    v = input(f"  {label}{c('2', f' [{default}]') if default else ''}: ").strip() or default
+                    if v:
+                        (args.extend if flag else pos.extend)([flag, v] if flag else [v])
+            except (EOFError, KeyboardInterrupt):
+                _print()
+                continue
+            argv = [cmd] + pos + args  # positionals first for argparse
+        last = argv
+        run(argv)
 
 
 def build_parser():
     p = argparse.ArgumentParser(prog="osintkit", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version="osintkit 1.2.0")
+    p.add_argument("--no-color", action="store_true", help="plain output without colors")
+    p.add_argument("--save", metavar="FILE", help="also write the output to FILE (put before the command)")
     s = p.add_subparsers(dest="cmd", required=True)
 
     x = s.add_parser("headers", help="analyze raw email headers"); x.add_argument("file", nargs="?", help="file (default stdin)")
@@ -1349,6 +1881,21 @@ def build_parser():
 
     x = s.add_parser("username", help="username footprint across sites"); x.add_argument("name")
     x.set_defaults(fn=cmd_username)
+
+    x = s.add_parser("exposure", help="open ports and known CVEs (Shodan InternetDB)"); x.add_argument("target")
+    x.add_argument("--max", type=int, default=15, help="max CVEs to list"); x.set_defaults(fn=cmd_exposure)
+
+    x = s.add_parser("cve", help="CVE severity, exploited-in-wild, EPSS"); x.add_argument("ids", nargs="+", metavar="CVE-ID")
+    x.set_defaults(fn=cmd_cve)
+
+    x = s.add_parser("tls", help="TLS certificate inspector"); x.add_argument("host", help="host or host:port")
+    x.set_defaults(fn=cmd_tls)
+
+    x = s.add_parser("exif", help="photo metadata and GPS extractor"); x.add_argument("paths", nargs="+", help="JPEG file(s), folder, or URL")
+    x.set_defaults(fn=cmd_exif)
+
+    x = s.add_parser("ip", help="IP location, network owner, Tor check"); x.add_argument("target", help="IP or domain")
+    x.set_defaults(fn=cmd_ip)
 
     x = s.add_parser("setup", help="guided API key setup")
     x.add_argument("--quick", action="store_true", help="just the 5 recommended free keys")
