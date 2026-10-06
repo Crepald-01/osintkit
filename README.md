@@ -12,11 +12,13 @@ A stdlib-only Python CLI bundling 13 open-source-intelligence tools, with a colo
 ## Install & first run
 
 ```
-pipx install git+https://github.com/Crepald-01/osintkit   # gives you a global `osintkit` command
-osintkit                                                    # opens the menu; offers a 2-minute key setup on first launch
+pip install git+https://github.com/Crepald-01/osintkit   # gives you a global `osintkit` command
+osintkit                                                   # opens the menu; offers a 2-minute key setup on first launch
 ```
 
-No pipx? Just clone and run `python osintkit.py` (Windows: `osintkit.bat`). Python 3.8+, no dependencies.
+If `osintkit` isn't found afterwards, Python's Scripts folder isn't on your PATH; use `python -m osintkit` instead (or install with `pipx`).
+
+No install? Just clone and run `python osintkit.py` (Windows: `osintkit.bat`). Python 3.8+, no dependencies.
 
 10 tools work with no keys at all. The rest (`ioc`, `company`, `brand`, `factcheck`) get more sources when you add free API keys:
 
