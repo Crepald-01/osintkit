@@ -1,0 +1,9 @@
+Return-Path: <bounce@mailer.evil-example.ru>
+Received: from mail.victim.com (mail.victim.com [10.0.0.5]) by mx.google.com with ESMTP; Tue, 6 Oct 2026 10:05:00 +0000
+Received: from unknown (HELO localhost) ([203.0.113.77]) by mail.victim.com with SMTP; Tue, 6 Oct 2026 10:04:50 +0000
+Received: from sender.evil-example.ru ([198.51.100.9]) by relay.evil-example.ru; Tue, 6 Oct 2026 10:04:00 +0000
+Authentication-Results: mx.google.com; spf=fail smtp.mailfrom=mailer.evil-example.ru; dkim=none; dmarc=fail header.from=paypal.com
+From: "PayPal Support support@paypal.com" <security@paypal.com>
+Reply-To: <help@free-mail-example.net>
+Subject: Urgent: verify your account
+Date: Tue, 6 Oct 2026 10:03:00 +0000
