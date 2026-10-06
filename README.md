@@ -9,13 +9,28 @@ A stdlib-only Python CLI bundling 13 open-source-intelligence tools, with a colo
   <img src="docs/screenshot.png" alt="Email header analysis" width="48%">
 </p>
 
-## Quick start
+## Install & first run
 
 ```
-python osintkit.py          # interactive menu
-python osintkit.py -h       # all commands
-python osintkit.py setup    # save API keys (optional)
+pipx install git+https://github.com/Crepald-01/osintkit   # gives you a global `osintkit` command
+osintkit                                                    # opens the menu; offers a 2-minute key setup on first launch
 ```
+
+No pipx? Just clone and run `python osintkit.py` (Windows: `osintkit.bat`). Python 3.8+, no dependencies.
+
+10 tools work with no keys at all. The rest (`ioc`, `company`, `brand`, `factcheck`) get more sources when you add free API keys:
+
+```
+osintkit setup                  # guided: quick start / everything / one tool; opens signup pages; checks each key as you paste it
+osintkit setup --only ioc       # just the keys one tool uses
+osintkit setup --set VT_API_KEY=xxxx --set ABUSEIPDB_KEY=yyyy   # non-interactive
+osintkit setup --from-env .env  # import from a .env file (or the environment if no file given)
+osintkit doctor                 # which tools are ready, and what each missing key unlocks
+```
+
+Keys are saved in plain text to `~/.osintkit/keys.json`; real environment variables take priority.
+
+## Tools
 
 | Command | Purpose |
 |---|---|

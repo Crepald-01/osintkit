@@ -1008,28 +1008,212 @@ LINKS = {
 }
 
 
-def cmd_setup(a):
-    import getpass
+GROUPS = [
+    ("Quick start (free, ~2 min)", ["OSINTKIT_CONTACT", "VT_API_KEY", "ABUSEIPDB_KEY", "ABUSECH_KEY", "GOOGLE_API_KEY"]),
+    ("Optional (free)", ["COMPANIES_HOUSE_KEY", "GITHUB_TOKEN", "GREYNOISE_KEY"]),
+    ("Paid / only if you need it", ["HIBP_KEY", "OPENCORPORATES_KEY"]),
+]
+TOOL_KEYS = {  # tool -> every key it can use
+    "ioc": ["VT_API_KEY", "ABUSEIPDB_KEY", "ABUSECH_KEY", "GREYNOISE_KEY"],
+    "company": ["OSINTKIT_CONTACT", "COMPANIES_HOUSE_KEY", "OPENCORPORATES_KEY"],
+    "brand": ["HIBP_KEY", "GITHUB_TOKEN"],
+    "factcheck": ["GOOGLE_API_KEY"],
+}
+REQUIRED = {  # keys a tool needs to be fully "ready" (each tool also has a keyless part)
+    "ioc": ["VT_API_KEY", "ABUSEIPDB_KEY", "ABUSECH_KEY"],
+    "company": ["OSINTKIT_CONTACT", "COMPANIES_HOUSE_KEY"],
+    "brand": ["HIBP_KEY", "GITHUB_TOKEN"],
+    "factcheck": ["GOOGLE_API_KEY"],
+}
+KEYLESS = ["headers", "wayback", "fly", "vessel", "sat", "monitor", "meta", "domain", "typosquat", "username"]
+
+_TESTS = {  # one cheap authenticated call per service
+    "VT_API_KEY": lambda v: http("https://www.virustotal.com/api/v3/ip_addresses/8.8.8.8", {"x-apikey": v}, js=True),
+    "ABUSEIPDB_KEY": lambda v: http("https://api.abuseipdb.com/api/v2/check?ipAddress=127.0.0.1", {"Key": v}, js=True),
+    "ABUSECH_KEY": lambda v: http("https://urlhaus-api.abuse.ch/v1/host/", {"Auth-Key": v}, {"host": "8.8.8.8"}, js=True),
+    "GREYNOISE_KEY": lambda v: http("https://api.greynoise.io/v3/community/8.8.8.8", {"key": v}, js=True),
+    "GITHUB_TOKEN": lambda v: http("https://api.github.com/user", {"Authorization": "Bearer " + v}, js=True),
+    "GOOGLE_API_KEY": lambda v: http("https://factchecktools.googleapis.com/v1alpha1/claims:search?query=test&key=" + v, js=True),
+    "COMPANIES_HOUSE_KEY": lambda v: http("https://api.company-information.service.gov.uk/search/companies?q=test",
+                                          {"Authorization": "Basic " + base64.b64encode((v + ":").encode()).decode()}, js=True),
+    "HIBP_KEY": lambda v: http("https://haveibeenpwned.com/api/v3/breachedaccount/test@example.com", {"hibp-api-key": v}, js=True),
+    "OPENCORPORATES_KEY": lambda v: http("https://api.opencorporates.com/v0.4/companies/search?q=test&api_token=" + v, js=True),
+}
+
+
+def _validate(k, v):
+    """(True|False|None, message): works / rejected / could not tell."""
+    if k == "OSINTKIT_CONTACT":
+        ok = bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.\w+", v))
+        return ok, "looks like an email" if ok else "does not look like an email address"
     try:
-        saved = json.load(open(KEYFILE))
+        _TESTS[k](v)
+        return True, "key works"
+    except Err as e:
+        m = str(e)
+        if "HTTP 404" in m:  # authenticated fine, just nothing found
+            return True, "key works"
+        if re.search(r"HTTP (400|401|403)", m):
+            return False, "rejected by the service (" + m.split(":")[0] + ")"
+        return None, "could not verify (network problem?)"
+
+
+def _mask(v):
+    return v[:3] + "…" + v[-4:] if len(v) > 10 else "set"
+
+
+def _signup_url(k):
+    m = re.search(r"https?://[^\s)]+", LINKS.get(k, ""))
+    return m.group(0) if m else None
+
+
+def _load_keys():
+    try:
+        return json.load(open(KEYFILE))
     except Exception:
-        saved = {}
-    print("Paste each key, or press Enter to skip / keep the current one. Input is hidden.\n")
-    for k, d in KEYS.items():
-        state = "set" if (saved.get(k) or os.environ.get(k)) else "not set"
-        print(f"{k}  [{state}]\n  {d}\n  get it: {LINKS.get(k, '')}")
-        v = (input if k == "OSINTKIT_CONTACT" else getpass.getpass)("  value: ").strip()
-        if v:
-            saved[k] = v
+        return {}
+
+
+def _save_keys(saved):
     os.makedirs(os.path.dirname(KEYFILE), exist_ok=True)
     json.dump(saved, open(KEYFILE, "w"), indent=2)
-    print(f"\nSaved {len(saved)} value(s) to {KEYFILE} (plain text - keep that file private).")
+    os.environ.update(saved)  # take effect immediately in this process
+
+
+def _ask_key(k, saved):
+    import getpass
+    import webbrowser
+    cur = saved.get(k) or os.environ.get(k)
+    url = _signup_url(k)
+    print(f"\n{c('1', k)}  {c('2', KEYS[k])}")
+    print(c("2", f"  {LINKS.get(k, '')}"))
+    if cur:
+        print(f"  currently set: {_mask(cur)}")
+    prompt = f"  paste it ({'Enter=keep' if cur else 'Enter=skip'}{', o=open signup page' if url else ''}): "
+    while True:
+        v = (input if k == "OSINTKIT_CONTACT" else getpass.getpass)(prompt).strip()
+        if v.lower() == "o" and url:
+            webbrowser.open(url)
+            print(c("2", "  opened in your browser - come back and paste the key"))
+            continue
+        if not v:
+            return None
+        with Spinner("checking key"):
+            ok, msg = _validate(k, v)
+        if ok:
+            print(c("32", f"  ✓ {msg}"))
+            return v
+        if ok is None:
+            print(c("33", f"  ? {msg} - saving anyway"))
+            return v
+        print(c("31", f"  ✗ {msg}"))
+        ch = input("  [r]etry / [s]ave anyway / Enter=skip: ").strip().lower()
+        if ch == "s":
+            return v
+        if ch != "r":
+            return None
+
+
+def cmd_setup(a):
+    saved = _load_keys()
+    # --- non-interactive modes
+    if a.set or a.from_env is not None:
+        incoming = {}
+        for item in a.set or []:
+            name, _, val = item.partition("=")
+            if name not in KEYS or not val:
+                raise Err(f"--set expects NAME=VALUE with NAME one of: {', '.join(KEYS)}")
+            incoming[name] = val
+        if a.from_env is not None:
+            src = dict(os.environ)
+            if a.from_env:
+                src = {}
+                for line in open(a.from_env, encoding="utf8"):
+                    n, _, val = line.strip().partition("=")
+                    if n and not n.startswith("#"):
+                        src[n.strip()] = val.strip().strip("\"'")
+            incoming.update({k: src[k] for k in KEYS if src.get(k)})
+        saved.update(incoming)
+        _save_keys(saved)
+        print(f"Saved {len(incoming)} key(s): {', '.join(incoming) or '-'}  ->  {KEYFILE}")
+        return
+    if not sys.stdin.isatty():
+        raise Err("setup is interactive; for scripts use: setup --set NAME=VALUE  or  setup --from-env [FILE]")
+
+    # --- choose which keys to ask for
+    if a.only:
+        keys = TOOL_KEYS[a.only]
+    elif a.quick:
+        keys = GROUPS[0][1]
+    else:
+        print(c("1", "What would you like to set up?"))
+        print(f"  {c('1;36', '1')}  Quick start - the 5 free keys that unlock most tools {c('2', '(recommended)')}")
+        print(f"  {c('1;36', '2')}  Everything - all {len(KEYS)} keys, grouped by cost")
+        print(f"  {c('1;36', '3')}  One tool only ({', '.join(TOOL_KEYS)})")
+        print(f"  {c('1;36', 'q')}  Cancel")
+        ch = input(c("1;35", "\n choice [1]: ")).strip().lower() or "1"
+        if ch == "q":
+            return
+        if ch == "3":
+            t = input(f" which tool ({'/'.join(TOOL_KEYS)}): ").strip().lower()
+            if t not in TOOL_KEYS:
+                raise Err("unknown tool")
+            keys = TOOL_KEYS[t]
+        elif ch == "2":
+            keys = [k for _, ks in GROUPS for k in ks]
+        else:
+            keys = GROUPS[0][1]
+    print(c("2", "\nTip: type 'o' at any prompt to open that service's signup page. Input is hidden. Keys are checked as you paste them."))
+
+    group_of = {k: g for g, ks in GROUPS for k in ks}
+    last = None
+    for k in keys:
+        if group_of[k] != last:
+            last = group_of[k]
+            h1(last)
+        v = _ask_key(k, saved)
+        if v:
+            saved[k] = v
+            _save_keys(saved)  # save as we go so Ctrl+C never loses work
+    print(f"\n{c('32', '✓')} Saved to {KEYFILE} (plain text - keep it private)\n")
+    cmd_doctor(None)
+
+
+def _have(k):
+    return bool(os.environ.get(k))
 
 
 def cmd_doctor(a):
-    for k, d in KEYS.items():
-        print(f" [{'x' if os.environ.get(k) else ' '}] {k:22} {d}")
-    print("\n Keyless tools: headers, wayback, fly, vessel, sat, monitor, meta, factcheck --image, GreyNoise, crt.sh")
+    h1("Tool readiness")
+    for t in KEYLESS:
+        print(f" {t:10} {c('32', 'ready')}      {c('2', 'no key needed')}")
+    for t, req in REQUIRED.items():
+        missing = [k for k in req if not _have(k)]
+        if not missing:
+            print(f" {t:10} {c('32', 'ready')}")
+        else:
+            print(f" {t:10} {c('33', 'partial')}    {c('2', 'missing ' + ', '.join(missing))}  ->  osintkit setup --only {t}")
+    print(c("2", "\n 'partial' tools still run; they just skip the sources that need the missing keys."))
+    print(c("2", f" Saved keys file: {KEYFILE}"))
+
+
+def first_run():
+    """One-time offer to run quick setup on the very first interactive launch."""
+    marker = os.path.join(STATE, "first_run")
+    if os.path.exists(KEYFILE) or os.path.exists(marker) or any(_have(k) for k in KEYS):
+        return
+    os.makedirs(STATE, exist_ok=True)
+    open(marker, "w").write("1")  # ask only once, whatever the answer
+    try:
+        ans = input(c("1", " Welcome! No API keys set yet.") + " Run the 2-minute quick setup now? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if ans in ("", "y", "yes"):
+        run(["setup", "--quick"])
+        print()
+    else:
+        print(c("2", " No problem - 10 tools work without keys. Run 'setup' from the menu any time.\n"))
 
 
 # (command, description, [(prompt, flag or None for positional, default)])
@@ -1066,12 +1250,17 @@ def run(argv):
         a.fn(a)
     except Err as e:
         _print(c("1;31", f"error: {e}"))
+    except EOFError:
+        _print(c("1;31", "error: this command needs interactive input (no terminal attached)"))
     except KeyboardInterrupt:
         _print()
 
 
 def menu():
     banner()
+    first_run()
+    if not any(_have(k) for k in KEYS):
+        _print(c("2", " tip: pick 'setup' to unlock ioc, factcheck, brand and company (10 tools already work without keys)\n"))
     while True:
         for i, (cmd, desc, _) in enumerate(MENU, 1):
             _print(f" {c('1;36', f'{i:>2}')}  {c('1', cmd.ljust(10))} {c('2', desc)}")
@@ -1161,8 +1350,14 @@ def build_parser():
     x = s.add_parser("username", help="username footprint across sites"); x.add_argument("name")
     x.set_defaults(fn=cmd_username)
 
-    x = s.add_parser("setup", help="enter and save API keys"); x.set_defaults(fn=cmd_setup)
-    x = s.add_parser("doctor", help="show configured API keys"); x.set_defaults(fn=cmd_doctor)
+    x = s.add_parser("setup", help="guided API key setup")
+    x.add_argument("--quick", action="store_true", help="just the 5 recommended free keys")
+    x.add_argument("--only", choices=list(TOOL_KEYS), help="only the keys one tool uses")
+    x.add_argument("--set", action="append", metavar="NAME=VALUE", help="save a key non-interactively (repeatable)")
+    x.add_argument("--from-env", nargs="?", const="", default=None, metavar="FILE",
+                   help="import keys from the environment, or from a .env file")
+    x.set_defaults(fn=cmd_setup)
+    x = s.add_parser("doctor", help="show which tools are ready"); x.set_defaults(fn=cmd_doctor)
 
     return p
 
