@@ -1,6 +1,6 @@
 # osintkit
 
-A stdlib-only Python CLI bundling 19 open-source-intelligence tools, with a categorized interactive menu, progress bars and result panels.
+A stdlib-only Python CLI bundling 29 open-source-intelligence tools, with a categorized interactive menu, progress bars and result panels.
 
 ![osintkit demo](docs/demo.gif)
 
@@ -36,26 +36,42 @@ Keys are saved in plain text to `~/.osintkit/keys.json`; real environment variab
 
 | Command | Purpose | Keys |
 |---|---|---|
+| **Email & identity** | | |
 | `headers` | Email header analyzer: relay path, SPF/DKIM/DMARC, spoof flags | none |
+| `email` | Email OSINT: mail provider, disposable?, Gravatar, reputation | none |
 | `username` | Username footprint across ~28 sites | none |
+| `gituser` | GitHub recon: repos, emails leaked in commits, active hours | none |
 | `factcheck` | Fact-check lookup + reverse-image links | claim lookup: Google key |
-| `domain` | DNS, email security, RDAP age, security headers, subdomains | none |
+| **Domains & network** | | |
+| `domain` | DNS, email security, RDAP age, security headers | none |
+| `subdomains` | Passive subdomain discovery from 6 sources + live check | none |
+| `pdns` | Passive DNS: IP history, reverse IP, threat-intel pulses | none |
+| `oldurls` | Wayback URL mining for old admin/backup/API paths | none |
+| `web` | Redirects, tech stack, cookies, robots.txt, favicon hash | none |
 | `typosquat` | Find registered lookalike / phishing domains | none |
 | `tls` | TLS certificate inspector + related names (SANs) | none |
 | `ip` | IP location, ASN, owner, abuse contact, Tor-exit check | none |
+| `asn` | BGP/ASN intel: prefixes, upstreams/downstreams, abuse contact | none |
 | `exposure` | Open ports and known CVEs for an IP/domain (Shodan InternetDB) | none |
 | `brand` | Brand exposure: HIBP, GitHub mentions, certificate transparency | optional |
+| **Threat intel** | | |
 | `ioc` | IP/domain/URL/hash enrichment (VirusTotal, AbuseIPDB, URLhaus, GreyNoise) | optional |
 | `cve` | CVE severity, exploited-in-the-wild (CISA KEV), EPSS | none |
+| `phish` | Phishing URL check: live feeds + heuristics | none |
+| `crypto` | Bitcoin / Ethereum address lookup + OFAC sanctions screening | none |
+| **Records & media** | | |
 | `company` | SEC EDGAR / Companies House / OpenCorporates | SEC: none |
 | `wayback` | Diff archived versions of a page | none |
 | `meta` | Document metadata leak finder (PDF/Office) | none |
 | `exif` | Photo metadata and embedded GPS extractor | none |
+| **Tracking & imagery** | | |
 | `fly` / `vessel` | Aircraft (ADS-B) and ship (AIS) tracking, geofence alerts | none |
 | `sat` | Sentinel-2 search and before/after comparison | none |
+| `geo` | Geocoder + sun/shadow calculator for photo geolocation | none |
+| **Monitoring** | | |
 | `monitor` | Keyword monitor for RSS feeds and public Telegram channels | none |
 
-15 of 19 tools need no keys at all.
+25 of 29 tools need no keys at all.
 
 ## Using the menu
 

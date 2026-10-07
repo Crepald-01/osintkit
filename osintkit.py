@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""osintkit - 19 defensive/research OSINT tools in one stdlib-only CLI.
+"""osintkit - 29 defensive/research OSINT tools in one stdlib-only CLI.
 
   headers   analyze raw email headers (relay path, SPF/DKIM/DMARC, spoof flags)
   company   company registries (SEC EDGAR, Companies House, OpenCorporates)
@@ -20,6 +20,16 @@
   tls       TLS certificate inspector + related names
   exif      photo metadata and embedded GPS
   ip        IP location, network owner, Tor-exit check
+  email     email OSINT: provider, disposable?, Gravatar, reputation
+  gituser   GitHub recon: repos, leaked commit emails, active hours
+  subdomains passive subdomain discovery (6 sources) + live check
+  pdns      passive DNS: IP history, reverse IP, threat-intel pulses
+  oldurls   Wayback URL mining for old admin/backup/API paths
+  web       web recon: redirects, tech, cookies, robots, favicon hash
+  asn       BGP/ASN intel: prefixes, upstreams, abuse contact
+  phish     phishing URL check: live feeds + heuristics
+  crypto    BTC/ETH address lookup + OFAC sanctions check
+  geo       geocode + sun/shadow calculator for photo geolocation
   setup     guided API key setup
   doctor    show which API keys are configured
 
@@ -1042,7 +1052,8 @@ REQUIRED = {  # keys a tool needs to be fully "ready" (each tool also has a keyl
     "factcheck": ["GOOGLE_API_KEY"],
 }
 KEYLESS = ["headers", "wayback", "fly", "vessel", "sat", "monitor", "meta", "domain", "typosquat", "username",
-           "exposure", "cve", "tls", "exif", "ip"]
+           "exposure", "cve", "tls", "exif", "ip", "email", "gituser", "subdomains", "pdns", "oldurls", "web", "asn",
+           "phish", "crypto", "geo"]
 
 _TESTS = {  # one cheap authenticated call per service
     "VT_API_KEY": lambda v: http("https://www.virustotal.com/api/v3/ip_addresses/8.8.8.8", {"x-apikey": v}, js=True),
@@ -1637,6 +1648,798 @@ def cmd_ip(a):
     print(c("2", f" next: osintkit exposure {ip}   |   osintkit ioc {ip}"))
 
 
+# ---------------------------------------------------------------- batch 3: ten more keyless tools
+import hashlib
+from datetime import datetime, timedelta, timezone
+
+HOT = re.compile(r"(^|[.-])(dev|stag\w*|test|qa|uat|admin|vpn|internal|intranet|jenkins|gitlab|git|grafana|kibana|"
+                 r"old|backup|beta|demo|sandbox|phpmyadmin|portal|sso)($|[.-]|\d)")
+
+
+def _reg(host):
+    p = host.lower().strip(".").split(".")
+    if len(p) >= 3 and len(p[-1]) == 2 and p[-2] in ("co", "com", "org", "net", "gov", "ac", "edu"):
+        return ".".join(p[-3:])
+    return ".".join(p[-2:])
+
+
+def _short(e, n=70):
+    return str(e).replace("\n", " ")[:n]
+
+
+# ---------------------------------------------------------------- subdomains
+def cmd_subdomains(a):
+    global NOSPIN
+    d = _host(a.domain).lower()
+    found = {}
+
+    def add(src, names):
+        for n in names:
+            n = n.strip().lower().lstrip("*.")
+            if n == d or n.endswith("." + d):
+                found.setdefault(n, set()).add(src)
+
+    sources = [
+        ("crt.sh", lambda: [n for x in http(f"https://crt.sh/?q=%25.{d}&output=json", js=True, timeout=60)
+                            for n in x["name_value"].splitlines()]),
+        ("certspotter", lambda: [n for x in http(
+            f"https://api.certspotter.com/v1/issuances?domain={d}&include_subdomains=true&expand=dns_names",
+            js=True, timeout=45) for n in x.get("dns_names", [])]),
+        ("urlscan", lambda: [v for x in http(f"https://urlscan.io/api/v1/search/?q=domain:{d}&size=100", js=True,
+                                             timeout=40).get("results", [])
+                             for v in (x.get("page", {}).get("domain"), x.get("task", {}).get("domain")) if v]),
+        ("rapiddns", lambda: re.findall(r">([a-z0-9._-]+\." + re.escape(d) + r")<", http(
+            f"https://rapiddns.io/subdomain/{d}?full=1", {"User-Agent": "Mozilla/5.0"}, timeout=40), re.I)),
+        ("hackertarget", lambda: [l.split(",")[0] for l in http(
+            f"https://api.hackertarget.com/hostsearch/?q={d}", timeout=30).splitlines() if "," in l]),
+        ("wayback", lambda: [parse.urlparse(r[0]).hostname or "" for r in http(
+            "https://web.archive.org/cdx/search/cdx?" + parse.urlencode(
+                {"url": d, "matchType": "domain", "fl": "original", "collapse": "urlkey", "limit": 3000, "output": "json"}),
+            js=True, timeout=60)[1:]]),
+    ]
+    h1(f"Passive sources for {d}")
+    for src, fn in sources:
+        try:
+            with Spinner(f"querying {src}"):
+                add(src, fn())
+            print(f" {src:13} {sum(1 for v in found.values() if src in v)} name(s)")
+        except (Err, ValueError, TypeError) as e:
+            print(f" {src:13} skipped: {_short(e)}")
+    names = sorted(found)
+    if not names:
+        raise Err("no subdomains found from any source")
+    alive = []
+    if not a.no_resolve:
+        from concurrent.futures import ThreadPoolExecutor
+        targets = names[: a.max_resolve]
+        prog = Progress(len(targets), "resolving")
+
+        def probe(n):
+            r = doh(n, "A")
+            prog.tick()
+            return n, r
+
+        NOSPIN = True
+        try:
+            with ThreadPoolExecutor(16) as ex:
+                alive = [(n, r) for n, r in ex.map(probe, targets) if r]
+        finally:
+            NOSPIN = False
+            prog.done()
+    shown = alive if not a.no_resolve else [(n, []) for n in names]
+    h1(f"{len(shown)} {'live ' if not a.no_resolve else ''}host(s) of {len(names)} discovered")
+    hot = 0
+    for n, ips in shown[: a.max]:
+        pre = n[: -len(d)].strip(".") if n != d else ""
+        flag = ""
+        if pre and HOT.search(pre):
+            flag = "   [!] pre-production/admin-looking host"
+            hot += 1
+        print(f" {n:46} {', '.join(ips[:2]):32}{flag}")
+    if len(shown) > a.max:
+        print(c("2", f" ... {len(shown) - a.max} more (raise --max)"))
+    panel("Attack surface", [f"{len(names)} names found, {len(alive)} resolving, {hot} look like dev/admin hosts",
+                             "next: osintkit web <host>   |   osintkit exposure <host>"], "33" if hot else "36")
+
+
+# ---------------------------------------------------------------- phish
+BRANDS = {"paypal": "paypal.com", "apple": "apple.com", "microsoft": "microsoft.com", "google": "google.com",
+          "amazon": "amazon.com", "netflix": "netflix.com", "facebook": "facebook.com", "instagram": "instagram.com",
+          "coinbase": "coinbase.com", "binance": "binance.com", "docusign": "docusign.com", "linkedin": "linkedin.com",
+          "whatsapp": "whatsapp.com", "dhl": "dhl.com", "fedex": "fedex.com", "chase": "chase.com", "outlook": "outlook.com",
+          "office365": "office.com", "wellsfargo": "wellsfargo.com", "steam": "steampowered.com", "telegram": "telegram.org"}
+BAD_TLDS = {"zip", "mov", "top", "xyz", "click", "country", "gq", "tk", "ml", "cf", "ga", "work", "support", "rest", "icu"}
+
+
+def cmd_phish(a):
+    t = a.target.strip()
+    u = parse.urlparse(t if "://" in t else "http://" + t)
+    host = (u.hostname or "").lower()
+    if not host:
+        raise Err("could not read a hostname from that input")
+    reg = _reg(host)
+    hits, flags, late_flags = [], [], []
+    h1(f"Phishing check: {t}")
+    try:
+        feed = [f for f in cached("https://urlhaus.abuse.ch/downloads/text_online/", "urlhaus_online.txt", ttl=1800).split()
+                if f.startswith("http")]
+        if not feed:
+            raise Err("feed returned no URLs")
+        exact = (t if "://" in t else "http://" + t) in feed
+        same_host = [f for f in feed if parse.urlparse(f).hostname == host]
+        if exact:
+            hits.append("URLhaus lists this exact URL as serving malware right now")
+        elif same_host and (_is_ip(host) or len(same_host) >= 1 and not u.path.strip("/")):
+            hits.append(f"URLhaus lists this host as serving malware right now ({len(same_host)} URL(s))")
+        elif same_host:  # e.g. a big legitimate platform that also hosts some abused files
+            late_flags.append(f"host also serves {len(same_host)} URLhaus-listed malware URL(s) (abused platform?), but not this URL")
+        print(f" URLhaus live malware URLs ({len(feed)}): "
+              f"{'LISTED' if exact else 'host listed (other paths)' if same_host else 'not listed'}")
+    except Err as e:
+        print(f" URLhaus: skipped ({_short(e)})")
+    try:
+        dom = set(cached("https://raw.githubusercontent.com/mitchellkrogza/Phishing.Database/master/phishing-domains-ACTIVE.txt",
+                         "phish_domains.txt").split())
+        listed = host in dom or reg in dom
+        if listed:
+            hits.append("Phishing.Database active-domain list")
+        print(f" Phishing.Database ({len(dom)} domains): {'LISTED' if listed else 'not listed'}")
+    except Err as e:
+        print(f" Phishing.Database: skipped ({_short(e)})")
+
+    h1("Heuristics")
+    for note in late_flags:  # informational only, not scored
+        print(c("2", f" [note] {note}"))
+    tld = host.rsplit(".", 1)[-1]
+    if _is_ip(host):
+        flags.append("host is a raw IP address")
+    if "xn--" in host:
+        flags.append("punycode/IDN domain - possible homoglyph lookalike")
+    if "@" in t.split("//", 1)[-1].split("/")[0]:
+        flags.append("'@' in the authority part hides the real destination")
+    if host.count(".") >= 4:
+        flags.append(f"{host.count('.')} subdomain levels - often used to bury the real domain")
+    if tld in BAD_TLDS:
+        flags.append(f"high-abuse TLD .{tld}")
+    if host.count("-") >= 3:
+        flags.append("many hyphens in hostname")
+    if len(t) > 120:
+        flags.append("very long URL")
+    for brand, real in BRANDS.items():
+        if brand in host and reg != real and not host.endswith("." + real):
+            flags.append(f"mentions '{brand}' but is not {real}")
+            break
+    if re.search(r"(login|signin|verify|secure|account|update|wallet|password)", u.path.lower() + host) and hits == []:
+        flags.append("credential-style words in the URL (login/verify/secure...)")
+    if not _is_ip(host):
+        try:
+            ev = _rdap(reg)[0]
+            if "registration" in ev:
+                age = _days_ago(ev["registration"])
+                print(f" domain registered {ev['registration'][:10]} ({age} days ago)")
+                if age < 30:
+                    flags.append(f"domain is only {age} days old")
+        except Err:
+            print(" registration age: unavailable")
+    for f in flags:
+        print(f" [!] {f}")
+    if not flags:
+        print(" no suspicious URL traits found")
+    bad = bool(hits)
+    lvl = "KNOWN PHISHING" if bad else "SUSPICIOUS" if len(flags) >= 2 else "NO KNOWN BAD" if not flags else "LOW RISK"
+    panel("Phishing verdict", [lvl] + hits + [f"{len(flags)} heuristic flag(s)"],
+          "31" if bad else "33" if len(flags) >= 2 else "32")
+
+
+# ---------------------------------------------------------------- email
+FREE_MAIL = {"gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "live.com", "icloud.com", "aol.com", "proton.me",
+             "protonmail.com", "gmx.com", "mail.com", "yandex.com", "zoho.com", "msn.com"}
+ROLES = {"admin", "info", "support", "sales", "contact", "noreply", "no-reply", "billing", "abuse", "postmaster", "hr",
+         "security", "webmaster", "office", "help", "hello", "team", "marketing", "press"}
+MX_HINTS = {"google.com": "Google Workspace / Gmail", "googlemail.com": "Google Workspace / Gmail",
+            "outlook.com": "Microsoft 365 / Outlook", "protection.outlook": "Microsoft 365", "pphosted": "Proofpoint",
+            "mimecast": "Mimecast", "zoho": "Zoho Mail", "protonmail": "Proton Mail", "yahoodns": "Yahoo",
+            "messagelabs": "Broadcom/Symantec", "barracuda": "Barracuda", "secureserver": "GoDaddy", "icloud": "Apple iCloud",
+            "mailgun": "Mailgun", "sendgrid": "SendGrid", "fastmail": "Fastmail"}
+
+
+def cmd_email(a):
+    e = a.address.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[a-z0-9-]{2,}", e):
+        raise Err("that doesn't look like an email address")
+    local, dom = e.rsplit("@", 1)
+    flags = []
+    h1(f"Email intelligence: {e}")
+    mx = doh(dom, "MX") or []
+    if mx:
+        hint = next((v for k, v in MX_HINTS.items() if any(k in m.lower() for m in mx)), None)
+        print(f" mail servers: {', '.join(m.split()[-1] for m in mx[:3])}" + (f"   -> {hint}" if hint else ""))
+    elif doh(dom, "A"):
+        print(" no MX records (falls back to the A record)")
+        flags.append("domain has no MX records, mail delivery is unlikely")
+    else:
+        flags.append("domain does not resolve - address cannot receive mail")
+        print(" [!] domain does not resolve")
+    try:
+        dis = set(cached("https://raw.githubusercontent.com/disposable-email-domains/disposable-email-domains/main/"
+                         "disposable_email_blocklist.conf", "disposable.txt").split())
+        if dom in dis:
+            flags.append("disposable/throwaway email provider")
+        print(f" disposable provider: {'YES' if dom in dis else 'no'}")
+    except Err:
+        print(" disposable check: skipped")
+    print(f" free mailbox provider: {'yes' if dom in FREE_MAIL else 'no (custom/company domain)'}")
+    if local in ROLES or local.split("+")[0] in ROLES:
+        print(" role account: yes (shared mailbox, not a person)")
+    txt = " ".join(doh(dom, "TXT") or [])
+    dmarc = " ".join(doh("_dmarc." + dom, "TXT") or [])
+    print(f" domain SPF: {'present' if 'v=spf1' in txt else 'MISSING'}   DMARC: {'present' if 'v=DMARC1' in dmarc else 'MISSING'}")
+    if dom not in FREE_MAIL and ("v=spf1" not in txt or "v=DMARC1" not in dmarc):
+        flags.append("domain lacks SPF/DMARC - easy to spoof")
+
+    h1("Online footprint")
+    try:
+        g = http(f"https://www.gravatar.com/{hashlib.md5(e.encode()).hexdigest()}.json", js=True, timeout=15)["entry"][0]
+        print(f" Gravatar profile: {g.get('displayName') or g.get('preferredUsername')}  ({g.get('profileUrl')})")
+        for acc in g.get("accounts", [])[:8]:
+            print(f"   linked account: {acc.get('shortname')} -> {acc.get('url')}")
+    except (Err, KeyError, IndexError, ValueError) as ex:
+        print(" Gravatar profile: none" if "404" in str(ex) else f" Gravatar: skipped ({_short(ex, 40)})")
+    try:
+        r = http(f"https://emailrep.io/{parse.quote(e)}", js=True, timeout=20)
+        d = r.get("details", {})
+        print(f" EmailRep: reputation {r.get('reputation')}, suspicious={r.get('suspicious')}, "
+              f"references={r.get('references')}")
+        print(f"   first seen {d.get('first_seen')}, last seen {d.get('last_seen')}, profiles: {', '.join(d.get('profiles', [])) or '-'}")
+        for k, lab in (("credentials_leaked", "credentials leaked"), ("data_breach", "in a data breach"),
+                       ("malicious_activity", "malicious activity"), ("spam", "spam reports"), ("blacklisted", "blacklisted")):
+            if d.get(k):
+                print(f" [!] {lab}")
+                flags.append(lab)
+        if r.get("suspicious"):
+            flags.append("EmailRep marks this address suspicious")
+    except Err as ex:
+        print(f" EmailRep: skipped ({_short(ex, 50)}; free tier is rate-limited)")
+    panel("Email verdict", flags or ["no red flags found"], "31" if len(flags) >= 2 else "33" if flags else "32")
+
+
+# ---------------------------------------------------------------- asn
+def _ripe(ep, res):
+    return http(f"https://stat.ripe.net/data/{ep}/data.json?resource={parse.quote(res)}", js=True, timeout=40).get("data", {})
+
+
+def cmd_asn(a):
+    t = a.target.strip()
+    if re.fullmatch(r"(?i)(as)?\d{1,10}", t):
+        asn = re.sub(r"(?i)^as", "", t)
+    else:
+        ip = t if _is_ip(t) else next(iter(doh(_host(t), "A") or []), None)
+        if not ip:
+            raise Err(f"could not resolve {t}")
+        ni = _ripe("network-info", ip)
+        if not ni.get("asns"):
+            raise Err(f"{ip} is not announced in BGP")
+        asn = ni["asns"][0]
+        print(f" {ip} is announced as {ni.get('prefix')} by AS{asn}")
+    h1(f"AS{asn}")
+    ov = _ripe("as-overview", "AS" + asn)
+    print(f" holder:    {ov.get('holder')}\n announced: {'yes' if ov.get('announced') else 'NO (not currently announced)'}")
+    pf = [p["prefix"] for p in _ripe("announced-prefixes", "AS" + asn).get("prefixes", [])]
+    v4 = [p for p in pf if ":" not in p]
+    print(f" prefixes:  {len(v4)} IPv4, {len(pf) - len(v4)} IPv6")
+    for p in sorted(v4)[: a.max]:
+        print(f"   {p}")
+    if len(v4) > a.max:
+        print(c("2", f"   ... {len(v4) - a.max} more IPv4 prefixes (raise --max)"))
+    try:
+        nb = _ripe("asn-neighbours", "AS" + asn)
+        nc = nb.get("neighbour_counts", {})
+        print(f"\n neighbours: {nc.get('left', '?')} upstream, {nc.get('right', '?')} downstream")
+        top = sorted(nb.get("neighbours", []), key=lambda x: -x.get("power", 0))[:10]
+        for n in top:
+            print(f"   AS{n['asn']:<8} {'upstream' if n['type'] == 'left' else 'downstream':11} visibility {n.get('power')}")
+    except Err:
+        pass
+    try:
+        ab = _ripe("abuse-contact-finder", "AS" + asn).get("abuse_contacts", [])
+        if ab:
+            print(f"\n abuse contact: {', '.join(ab)}")
+    except Err:
+        pass
+    print(c("2", f"\n next: osintkit exposure <ip in range>   |   https://bgp.he.net/AS{asn}"))
+
+
+# ---------------------------------------------------------------- pdns
+def cmd_pdns(a):
+    t = _host(a.target)
+    ip_in = _is_ip(t)
+    rows = http(f"https://api.mnemonic.no/pdns/v3/{parse.quote(t)}?limit=1000", js=True, timeout=45).get("data", [])
+    day = lambda ms: time.strftime("%Y-%m-%d", time.gmtime(ms / 1000))
+    grp = {}
+    for r in rows:
+        if r.get("rrtype") not in ("a", "aaaa"):
+            continue
+        key = r["query"] if ip_in else r["answer"]
+        g = grp.setdefault(key, [r["firstSeenTimestamp"], r["lastSeenTimestamp"], 0])
+        g[0] = min(g[0], r["firstSeenTimestamp"])
+        g[1] = max(g[1], r["lastSeenTimestamp"])
+        g[2] += r.get("times", 0)
+    ordered = sorted(grp.items(), key=lambda kv: kv[1][1], reverse=True)
+    h1(f"{len(grp)} hostname(s) have pointed at {t}  (reverse IP)" if ip_in else f"{len(grp)} IP address(es) have served {t}")
+    for k, (f, l, n) in ordered[: a.max]:
+        print(f" {k:46} first {day(f)}   last {day(l)}   seen {n:,}x")
+    if not grp:
+        print(" no passive-DNS history found")
+    elif len(grp) > a.max:
+        print(c("2", f" ... {len(grp) - a.max} more (raise --max)"))
+    if grp and not ip_in and len(grp) > 1:
+        yr = (time.time() - 365 * 86400) * 1000
+        recent = sum(1 for _, (f, l, n) in grp.items() if l >= yr)
+        print(c("2", f"\n {len(grp)} distinct IPs over time, {recent} seen in the last year (hosting moves, CDN or load balancing)"))
+    print(c("2", " passive DNS data: mnemonic.no (free, non-commercial)"))
+    try:
+        kind = ("IPv6" if ":" in t else "IPv4") if ip_in else "domain"
+        pi = http(f"https://otx.alienvault.com/api/v1/indicators/{kind}/{t}/general", js=True, timeout=30).get("pulse_info", {})
+        h1("Threat-intel references (AlienVault OTX)")
+        if pi.get("count"):
+            print(f" [!] appears in {pi['count']} threat-intel pulse(s)")
+            for p in pi.get("pulses", [])[:5]:
+                print(f"   - {p.get('name')}")
+        else:
+            print(" not referenced in any pulse")
+    except Err:
+        pass
+
+
+# ---------------------------------------------------------------- gituser
+def cmd_gituser(a):
+    u = a.name.strip().lstrip("@")
+    gh = lambda path: http("https://api.github.com" + path, {"Accept": "application/vnd.github+json"}, js=True, timeout=30)
+    try:
+        p = gh(f"/users/{parse.quote(u)}")
+    except Err as e:
+        if "404" in str(e):
+            raise Err(f"no GitHub user or org named '{u}'")
+        if "403" in str(e):
+            raise Err("GitHub rate limit reached (60 requests/hour without a token); try again later")
+        raise
+    print(c("2", " Public data only. Use on your own account or with consent; do not use it to profile private people."))
+    h1(f"{p.get('login')}  ({p.get('type')})")
+    for lab, k in (("name", "name"), ("bio", "bio"), ("company", "company"), ("location", "location"), ("website", "blog"),
+                   ("public email", "email"), ("twitter/X", "twitter_username")):
+        if p.get(k):
+            print(f" {lab + ':':13} {p[k]}")
+    print(f" {'created:':13} {p.get('created_at', '')[:10]}   followers {p.get('followers')}  following {p.get('following')}  "
+          f"repos {p.get('public_repos')}  gists {p.get('public_gists')}")
+    try:
+        orgs = [o["login"] for o in gh(f"/users/{u}/orgs")]
+        if orgs:
+            print(f" {'orgs:':13} {', '.join(orgs)}")
+    except Err:
+        pass
+    try:
+        repos = gh(f"/users/{u}/repos?per_page=100&sort=pushed")
+        langs = Counter(r["language"] for r in repos if r.get("language"))
+        print(f" {'languages:':13} {', '.join(f'{k} ({v})' for k, v in langs.most_common(6)) or '-'}")
+        h1("Most-starred repos")
+        for r in sorted(repos, key=lambda r: -r["stargazers_count"])[:5]:
+            print(f" {r['stargazers_count']:>6} *  {r['name']:30} {(r.get('description') or '')[:50]}")
+    except Err:
+        pass
+    flags = []
+    try:
+        ev = gh(f"/users/{u}/events/public?per_page=100")
+        emails = Counter()
+        hours = Counter()
+        for e in ev:
+            hours[int(e["created_at"][11:13])] += 1
+            for cm in (e.get("payload", {}).get("commits") or []):
+                au = cm.get("author", {})
+                if au.get("email"):
+                    emails[(au["email"], au.get("name", ""))] += 1
+        h1("Emails in recent public commits")
+        real = [(k, v) for k, v in emails.items() if "noreply.github.com" not in k[0]]
+        if real:
+            for (em, nm), n in sorted(real, key=lambda kv: -kv[1])[:6]:
+                print(f" [!] {em}  ({nm}, {n} commit(s))")
+            flags.append(f"{len(real)} real email address(es) exposed in commits")
+            print(c("2", " tip: Settings -> Emails -> 'Keep my email private' + 'Block command line pushes that expose my email'"))
+        else:
+            print(" none exposed (noreply addresses only)" if emails else " no recent push events")
+        if hours:
+            h1("Activity by hour (UTC) - hints at timezone")
+            mx = max(hours.values())
+            for hr in range(24):
+                if hours[hr]:
+                    print(f" {hr:02d}h {'█' * max(1, round(20 * hours[hr] / mx))} {hours[hr]}")
+    except Err:
+        pass
+    try:
+        keys = gh(f"/users/{u}/keys")
+        print(f"\n public SSH keys: {len(keys)}   (https://github.com/{u}.keys)")
+    except Err:
+        pass
+    panel("GitHub exposure", flags or ["no obvious identity leaks in recent activity"], "33" if flags else "32")
+
+
+# ---------------------------------------------------------------- oldurls
+URL_CATS = [
+    ("Backups, dumps & secrets", r"\.(env|git|svn|bak|old|backup|sql|zip|tar|gz|7z|rar|log|conf|config|ini|ya?ml|pem|key|pfx|swp|htpasswd|DS_Store)(\?|$|/)"),
+    ("Admin & login panels", r"(admin|wp-admin|wp-login|phpmyadmin|dashboard|console|login|signin|cpanel|manager|jenkins|grafana|kibana)"),
+    ("APIs & docs", r"(/api/|/v[1-9]/|swagger|openapi|graphql|api-docs|redoc)"),
+    ("Dev / test / staging paths", r"(/(dev|test|staging|stage|qa|debug|internal|old|beta|demo|tmp|temp)(/|$))"),
+    ("Uploads & files", r"(upload|/files/|/documents/|/download)"),
+    ("Secrets in query strings", r"[?&](api[_-]?key|token|secret|passw(or)?d|auth|session|access[_-]?token|apikey)="),
+]
+
+
+def cmd_oldurls(a):
+    d = _host(a.domain).lower()
+    rows = http("https://web.archive.org/cdx/search/cdx?" + parse.urlencode(
+        {"url": d, "matchType": "domain", "fl": "original,timestamp", "collapse": "urlkey", "limit": a.limit,
+         "output": "json", "filter": "!statuscode:404"}), js=True, timeout=120)[1:]
+    if not rows:
+        raise Err("the Wayback Machine has no URLs for that domain")
+    h1(f"{len(rows)} archived URL(s) for {d}")
+    hosts = Counter(parse.urlparse(u).hostname for u, _ in rows)
+    print(f" hosts seen: {', '.join(f'{h} ({n})' for h, n in hosts.most_common(8))}")
+    total = 0
+    for title, rx in URL_CATS:
+        m = [(u, ts) for u, ts in rows if re.search(rx, u, re.I)]
+        if not m:
+            continue
+        total += len(m)
+        h1(f"{title}: {len(m)}")
+        for u, ts in m[: a.show]:
+            print(f"  {u[:100]}")
+            print(c("2", f"    https://web.archive.org/web/{ts}/{u[:150]}"))
+    params = Counter(k for u, _ in rows for k in parse.parse_qs(parse.urlparse(u).query))
+    if params:
+        print(f"\n common parameters: {', '.join(k for k, _ in params.most_common(15))}")
+    panel("Archive recon", [f"{len(rows)} URLs, {total} interesting match(es)",
+                            "old URLs may still work: check them on the live site (your own sites only)"], "33" if total else "32")
+
+
+# ---------------------------------------------------------------- web
+class _NoRedirect(request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kw):
+        return None
+
+
+def _fetch(url, limit=1_500_000, timeout=15):
+    try:
+        r = request.build_opener(_NoRedirect).open(
+            request.Request(url, headers={"User-Agent": "Mozilla/5.0 osintkit"}), timeout=timeout)
+        return r.status, r.headers, r.read(limit)
+    except error.HTTPError as e:
+        return e.code, e.headers, (e.read(limit) if e.code >= 400 else b"")
+    except Exception as e:
+        raise Err(f"{url}: {_short(e)}")
+
+
+def _mmh3(data, seed=0):
+    M = 0xFFFFFFFF
+    c1, c2 = 0xCC9E2D51, 0x1B873593
+    h, n = seed, len(data)
+    rounded = n & ~3
+    for i in range(0, rounded, 4):
+        k = int.from_bytes(data[i:i + 4], "little")
+        k = (k * c1) & M
+        k = ((k << 15) | (k >> 17)) & M
+        k = (k * c2) & M
+        h ^= k
+        h = ((h << 13) | (h >> 19)) & M
+        h = (h * 5 + 0xE6546B64) & M
+    tail, k = data[rounded:], 0
+    if len(tail) >= 3:
+        k ^= tail[2] << 16
+    if len(tail) >= 2:
+        k ^= tail[1] << 8
+    if len(tail) >= 1:
+        k ^= tail[0]
+        k = (k * c1) & M
+        k = ((k << 15) | (k >> 17)) & M
+        k = (k * c2) & M
+        h ^= k
+    h ^= n
+    h ^= h >> 16
+    h = (h * 0x85EBCA6B) & M
+    h ^= h >> 13
+    h = (h * 0xC2B2AE35) & M
+    h ^= h >> 16
+    return h - (1 << 32) if h & 0x80000000 else h
+
+
+TECH = [
+    ("WordPress", r"wp-content|wp-includes"), ("Drupal", r"drupal|sites/default/files"), ("Joomla", r"joomla!|/media/jui/|com_content"),
+    ("Shopify", r"cdn\.shopify\.com|x-shopify|shopify\.theme"), ("Wix", r"wixstatic|wix\.com"), ("Squarespace", r"squarespace"),
+    ("Next.js", r"/_next/|__next"), ("React", r"data-reactroot|react(\.|-)dom"), ("Vue.js", r"vue(\.min)?\.js|vue@\d|data-v-[0-9a-f]{6,}"),
+    ("Angular", r"ng-version|angular(\.min)?\.js|@angular"), ("jQuery", r"jquery[.-]?\d|jquery\.min"),
+    ("Bootstrap", r"bootstrap(\.min)?\.(css|js)|bootstrap@\d"),
+    ("Cloudflare", r"cf-ray|server: cloudflare"), ("nginx", r"server: nginx"), ("Apache", r"server: apache"),
+    ("PHP", r"x-powered-by: php|\.php"), ("ASP.NET", r"x-powered-by: asp\.net|__viewstate"), ("Express", r"x-powered-by: express"),
+    ("Laravel", r"laravel_session|x-powered-by: laravel"), ("Django", r"csrftoken|csrfmiddlewaretoken"),
+    ("Google Analytics", r"google-analytics\.com|gtag\(|googletagmanager\.com/gtag"), ("Google Tag Manager", r"googletagmanager\.com/gtm"),
+    ("Hotjar", r"hotjar"), ("Stripe", r"js\.stripe\.com"), ("reCAPTCHA", r"recaptcha"), ("Magento", r"magento|/static/version\d+/|mage/cookies"),
+    ("WooCommerce", r"woocommerce"), ("Cloudfront", r"cloudfront\.net|x-amz-cf"), ("Fastly", r"x-served-by.*cache|fastly"),
+    ("Vercel", r"x-vercel|server: vercel"), ("Netlify", r"server: netlify|x-nf-request"),
+]
+SENSITIVE_PATH = re.compile(r"admin|backup|private|internal|secret|config|\.sql|\.git|\.env|\.svn|login|staging|test|dev|tmp|cgi|api", re.I)
+
+
+def cmd_web(a):
+    url = a.url.strip()
+    if "://" not in url:
+        url = "https://" + url
+    h1("Redirect chain")
+    cur, hist, status, hd, body = url, [], 0, None, b""
+    for _ in range(8):
+        with Spinner(f"fetching {parse.urlparse(cur).netloc}"):
+            status, hd, body = _fetch(cur)
+        print(f" {status}  {cur}")
+        loc = hd.get("Location")
+        if 300 <= status < 400 and loc:
+            cur = parse.urljoin(cur, loc)
+            continue
+        break
+    html_ = body.decode("utf8", "replace")
+    low = (str(hd).lower() + "\n" + html_.lower())
+    origin = "{0.scheme}://{0.netloc}".format(parse.urlparse(cur))
+    flags = []
+    h1("Server & security")
+    print(f" server: {hd.get('Server', 'hidden')}   powered-by: {hd.get('X-Powered-By', '-')}   type: {hd.get('Content-Type', '-')}")
+    miss = [n for n, k in (("HSTS", "Strict-Transport-Security"), ("CSP", "Content-Security-Policy"),
+                           ("X-Frame-Options", "X-Frame-Options"), ("X-Content-Type-Options", "X-Content-Type-Options"),
+                           ("Referrer-Policy", "Referrer-Policy")) if k not in hd]
+    if miss:
+        print(f" [!] missing headers: {', '.join(miss)}")
+        flags.append(f"{len(miss)} security header(s) missing")
+    if hd.get("Server") and re.search(r"\d+\.\d+", hd.get("Server", "")):
+        print(f" [!] server version disclosed: {hd['Server']}")
+        flags.append("server version disclosed")
+    for ck in hd.get_all("Set-Cookie") or []:
+        name = ck.split("=", 1)[0]
+        bad = [f for f, ok in (("Secure", "secure" in ck.lower()), ("HttpOnly", "httponly" in ck.lower()),
+                               ("SameSite", "samesite" in ck.lower())) if not ok]
+        print(f" cookie {name}: " + (f"[!] missing {', '.join(bad)}" if bad else "Secure; HttpOnly; SameSite"))
+        if bad:
+            flags.append(f"cookie '{name}' missing {', '.join(bad)}")
+    h1("Technology")
+    tech = sorted({n for n, rx in TECH if re.search(rx, low)} | ({"GitHub Pages"} if (parse.urlparse(cur).hostname or "").endswith(".github.io") else set()))
+    m = re.search(r"<meta[^>]+name=[\"']generator[\"'][^>]+content=[\"']([^\"']+)", html_, re.I)
+    t = re.search(r"<title[^>]*>(.*?)</title>", html_, re.I | re.S)
+    print(f" title: {html.unescape(t.group(1).strip())[:90] if t else '-'}")
+    print(f" detected: {', '.join(tech) or 'nothing recognised'}" + (f"   generator: {m.group(1)}" if m else ""))
+    h1("robots.txt / security.txt")
+    try:
+        st, _, rb = _fetch(origin + "/robots.txt")
+        txt = rb.decode("utf8", "replace")
+        if st == 200 and re.search(r"(?i)disallow|sitemap", txt):
+            dis = sorted({l.split(":", 1)[1].strip() for l in txt.splitlines() if l.lower().startswith("disallow:") and l.split(":", 1)[1].strip()})
+            sens = [p for p in dis if SENSITIVE_PATH.search(p)]
+            rest = [p for p in dis if p not in sens]
+            print(f" robots.txt lists {len(dis)} disallowed path(s), {len(sens)} look sensitive:")
+            for p in sens[:12]:
+                print(f"   [!] {p}")
+            for p in rest[:6]:
+                print(f"       {p}")
+            if len(dis) > 18:
+                print(c("2", f"       ... {len(dis) - min(len(dis), 18)} more"))
+            for l in txt.splitlines():
+                if l.lower().startswith("sitemap:"):
+                    print(f"   sitemap: {l.split(':', 1)[1].strip()}")
+        else:
+            print(f" robots.txt: HTTP {st}")
+        st, _, sb = _fetch(origin + "/.well-known/security.txt")
+        if st == 200 and b"Contact" in sb:
+            print(" security.txt: " + "; ".join(l.strip() for l in sb.decode("utf8", "replace").splitlines() if l.startswith(("Contact", "Expires")))[:150])
+        else:
+            print(" security.txt: not published")
+    except Err as e:
+        print(f" skipped: {e}")
+    h1("Favicon fingerprint & contacts")
+    try:
+        mm = re.search(r"<link[^>]+rel=[\"'][^\"']*icon[^\"']*[\"'][^>]*href=[\"']([^\"']+)", html_, re.I)
+        fav = parse.urljoin(cur, mm.group(1)) if mm else origin + "/favicon.ico"
+        st, _, fb = _fetch(fav)
+        if st == 200 and fb:
+            hsh = _mmh3(base64.encodebytes(fb))
+            print(f" favicon hash: {hsh}   -> Shodan: http.favicon.hash:{hsh}")
+            print(c("2", " search that hash on Shodan/Censys to find other servers (even origin IPs behind a CDN) using the same favicon"))
+        else:
+            print(f" no favicon (HTTP {st})")
+    except Err as e:
+        print(f" favicon skipped: {e}")
+    emails = sorted(set(re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+\.?[a-z]{2,}", html_, re.I)))[:8]
+    socials = sorted({s.rstrip("/\"'") for s in re.findall(
+        r"https?://(?:www\.)?(?:twitter\.com|x\.com|github\.com|linkedin\.com|facebook\.com|instagram\.com|youtube\.com|t\.me|discord\.gg)/[\w./@-]+", html_)})[:10]
+    if emails:
+        print(f" emails on page: {', '.join(emails)}")
+    for s in socials:
+        print(f" social: {s}")
+    panel("Web recon", [f"{len(tech)} technologies, {len(flags)} security finding(s)"] + flags[:5], "33" if flags else "32")
+
+
+# ---------------------------------------------------------------- crypto
+OFAC = "https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_{}.txt"
+
+
+def _ts(x):
+    return time.strftime("%Y-%m-%d %H:%M", time.gmtime(x))
+
+
+def cmd_crypto(a):
+    ad = a.address.strip()
+    flags = []
+    if re.fullmatch(r"0x[a-fA-F0-9]{40}", ad):
+        chain = "ETH"
+    elif re.fullmatch(r"(bc1[a-z0-9]{20,90}|[13][a-km-zA-HJ-NP-Z1-9]{25,39})", ad):
+        chain = "XBT"
+    else:
+        raise Err("unrecognised address (supported: Bitcoin and Ethereum)")
+    h1(f"{'Ethereum' if chain == 'ETH' else 'Bitcoin'} address {ad}")
+    if chain == "XBT":
+        r = http(f"https://blockchain.info/rawaddr/{ad}?limit=10", js=True, timeout=40)
+        try:
+            usd = http("https://blockchain.info/ticker", js=True, timeout=15)["USD"]["last"]
+        except (Err, KeyError):
+            usd = None
+        f = lambda s: f"{s / 1e8:.8f} BTC" + (f"  (~${s / 1e8 * usd:,.0f})" if usd else "")
+        print(f" balance:        {f(r['final_balance'])}\n total received: {f(r['total_received'])}\n total sent:     {f(r['total_sent'])}")
+        print(f" transactions:   {r['n_tx']}")
+        if r["n_tx"]:
+            try:
+                first = http(f"https://blockchain.info/rawaddr/{ad}?limit=1&offset={r['n_tx'] - 1}", js=True, timeout=40)["txs"][0]["time"]
+                print(f" first activity: {_ts(first)} UTC   last: {_ts(r['txs'][0]['time'])} UTC")
+            except (Err, KeyError, IndexError):
+                pass
+            h1("Recent transactions")
+            for tx in r["txs"][:8]:
+                print(f" {_ts(tx['time'])}  {tx['result'] / 1e8:+.8f} BTC   {tx['hash'][:20]}...")
+        if r["n_tx"] > 1000:
+            flags.append("very high transaction count (a service, exchange or heavily reused address)")
+    else:
+        base = "https://eth.blockscout.com/api/v2"
+        r = http(f"{base}/addresses/{ad}", js=True, timeout=40)
+        price = None
+        try:
+            price = float(http(f"{base}/stats", js=True, timeout=15).get("coin_price") or 0) or None
+        except (Err, ValueError):
+            pass
+        bal = int(r.get("coin_balance") or 0) / 1e18
+        print(f" balance:      {bal:.6f} ETH" + (f"  (~${bal * price:,.0f})" if price else ""))
+        print(f" type:         {'has contract code (smart contract or EIP-7702 delegated account)' if r.get('is_contract') else 'externally owned account'}"
+              + (f"   name: {r['name']}" if r.get("name") else "") + (f"   ENS: {r['ens_domain_name']}" if r.get("ens_domain_name") else ""))
+        try:
+            cn = http(f"{base}/addresses/{ad}/counters", js=True, timeout=30)
+            print(f" transactions: {cn.get('transactions_count')}   token transfers: {cn.get('token_transfers_count')}")
+        except Err:
+            pass
+        try:
+            txs = http(f"{base}/addresses/{ad}/transactions", js=True, timeout=40).get("items", [])
+            h1("Recent transactions")
+            for tx in txs[:8]:
+                dirn = "OUT" if tx["from"]["hash"].lower() == ad.lower() else "IN "
+                other = tx["to"]["hash"] if dirn == "OUT" and tx.get("to") else tx["from"]["hash"]
+                print(f" {tx['timestamp'][:16].replace('T', ' ')}  {dirn} {int(tx['value']) / 1e18:>12.6f} ETH  {other[:14]}...")
+        except Err:
+            pass
+    h1("Sanctions screening (OFAC SDN digital-currency addresses)")
+    try:
+        lst = {x.strip().lower() for x in cached(OFAC.format(chain), f"ofac_{chain}.txt", ttl=86400).split()}
+        if ad.lower() in lst:
+            print(" [!] THIS ADDRESS IS ON THE OFAC SANCTIONS LIST")
+            flags.insert(0, "OFAC-sanctioned address")
+        else:
+            print(f" not on the OFAC list ({len(lst)} addresses checked)")
+    except Err as e:
+        print(f" skipped: {_short(e)}")
+    panel("Address verdict", flags or ["no sanctions hit; review the transaction pattern yourself"], "31" if flags else "32")
+    print(c("2", f" explorer: {'https://etherscan.io/address/' if chain == 'ETH' else 'https://www.blockchain.com/explorer/addresses/btc/'}{ad}"))
+
+
+# ---------------------------------------------------------------- geo
+def _sun(lat, lon, dt):
+    """NOAA solar position. Returns (elevation_deg, azimuth_deg) for an aware UTC datetime."""
+    from math import radians as R, degrees as D, sin, cos, tan, asin, acos
+    jd = dt.timestamp() / 86400 + 2440587.5
+    T = (jd - 2451545.0) / 36525
+    L0 = (280.46646 + T * (36000.76983 + T * 0.0003032)) % 360
+    M = 357.52911 + T * (35999.05029 - 0.0001537 * T)
+    e = 0.016708634 - T * (0.000042037 + 0.0000001267 * T)
+    C = (sin(R(M)) * (1.914602 - T * (0.004817 + 0.000014 * T)) + sin(R(2 * M)) * (0.019993 - 0.000101 * T)
+         + sin(R(3 * M)) * 0.000289)
+    om = 125.04 - 1934.136 * T
+    lam = L0 + C - 0.00569 - 0.00478 * sin(R(om))
+    eps = 23 + (26 + (21.448 - T * (46.815 + T * (0.00059 - T * 0.001813))) / 60) / 60 + 0.00256 * cos(R(om))
+    decl = asin(sin(R(eps)) * sin(R(lam)))
+    y = tan(R(eps) / 2) ** 2
+    eq = 4 * D(y * sin(2 * R(L0)) - 2 * e * sin(R(M)) + 4 * e * y * sin(R(M)) * cos(2 * R(L0))
+               - 0.5 * y * y * sin(4 * R(L0)) - 1.25 * e * e * sin(2 * R(M)))
+    tst = (dt.hour * 60 + dt.minute + dt.second / 60 + eq + 4 * lon) % 1440
+    ha = tst / 4 - 180
+    cz = sin(R(lat)) * sin(decl) + cos(R(lat)) * cos(decl) * cos(R(ha))
+    zen = acos(max(-1, min(1, cz)))
+    elev = 90 - D(zen)
+    den = cos(R(lat)) * sin(zen)
+    az = D(acos(max(-1, min(1, (sin(R(lat)) * cos(zen) - sin(decl)) / den)))) if abs(den) > 1e-9 else 180.0
+    az = (az + 180) % 360 if ha > 0 else (540 - az) % 360
+    return elev, az
+
+
+def _fmt_time(m):
+    return f"{int(m // 60):02d}:{int(m % 60):02d}"
+
+
+def cmd_geo(a):
+    from math import tan, radians as R, degrees as D, atan
+    q = a.query.strip()
+    m = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*", q)
+    def photon(url):  # keyless geocoder (komoot Photon); returns [(lat, lon, name, kind)]
+        out = []
+        for f in http(url, js=True, timeout=30).get("features", []):
+            p, (lo, la) = f["properties"], f["geometry"]["coordinates"]
+            parts = [p.get("name"), " ".join(x for x in (p.get("street"), p.get("housenumber")) if x), p.get("district"),
+                     p.get("city"), p.get("state"), p.get("postcode"), p.get("country")]
+            out.append((la, lo, ", ".join(x for x in parts if x), f"{p.get('osm_key', '')}/{p.get('osm_value', '')}"))
+        return out
+
+    if m:
+        lat, lon = float(m.group(1)), float(m.group(2))
+        try:
+            rows = photon(f"https://photon.komoot.io/reverse?lat={lat}&lon={lon}")
+        except Err:
+            rows = []
+        name, kind = (rows[0][2], rows[0][3]) if rows else ("(no address data here)", "")
+    else:
+        rows = photon(f"https://photon.komoot.io/api/?q={parse.quote(q)}&limit=5")
+        if not rows:
+            raise Err(f"nothing found for '{q}'")
+        if len(rows) > 1:
+            h1("Matches (use --pick N for another)")
+            for i, (la, lo, nm, kd) in enumerate(rows, 1):
+                print(f" [{i}] {nm[:78]}  ({la:.4f}, {lo:.4f})")
+        if not 1 <= a.pick <= len(rows):
+            raise Err(f"--pick must be between 1 and {len(rows)}")
+        lat, lon, name, kind = rows[a.pick - 1]
+    h1("Location")
+    print(f" {name}\n coordinates: {lat:.6f}, {lon:.6f}   ({kind})")
+    print(f" https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=17/{lat}/{lon}")
+    print(f" https://www.google.com/maps?q={lat},{lon}&t=k")
+    print(f" https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat},{lon}")
+    print(f" https://earth.google.com/web/@{lat},{lon},0a,1000d,35y,0h,0t,0r")
+    try:
+        when = datetime.fromisoformat(a.at).replace(tzinfo=timezone.utc) if a.at else datetime.now(timezone.utc)
+    except ValueError:
+        raise Err("--at must look like 2026-06-21T14:30 (UTC)")
+    elev, az = _sun(lat, lon, when)
+    h1(f"Sun position at {when:%Y-%m-%d %H:%M} UTC")
+    print(f" elevation {elev:.1f} deg   azimuth {az:.1f} deg (0=N, 90=E)")
+    if elev > 0:
+        print(f" a 1 m object casts a {1 / tan(R(elev)):.2f} m shadow pointing toward azimuth {(az + 180) % 360:.0f} deg")
+    else:
+        print(" the sun is below the horizon (no shadows)")
+    day = datetime(when.year, when.month, when.day, tzinfo=timezone.utc)
+    series = [(mn, *_sun(lat, lon, day + timedelta(minutes=mn))) for mn in range(0, 1440, 2)]
+    cross = lambda lvl: [(series[i][0] + series[i + 1][0]) / 2 for i in range(len(series) - 1)
+                         if (series[i][1] - lvl) * (series[i + 1][1] - lvl) < 0]
+    rises = cross(-0.833)
+    peak = max(series, key=lambda s: s[1])
+    print(f" that day (UTC): solar noon about {_fmt_time(peak[0])} (max elevation {peak[1]:.1f} deg); "
+          + (f"sun crosses the horizon at {', '.join(_fmt_time(x) for x in rises)}" if rises else "no sunrise/sunset (polar day/night)"))
+    if a.shadow:
+        target = D(atan(1 / a.shadow))
+        hits = cross(target)
+        h1(f"When is shadow length = {a.shadow} x object height?  (sun elevation {target:.1f} deg)")
+        for mn in hits:
+            e2, a2 = _sun(lat, lon, day + timedelta(minutes=mn))
+            print(f" {_fmt_time(mn)} UTC   sun azimuth {a2:.0f} deg -> shadow points {(a2 + 180) % 360:.0f} deg")
+        if not hits:
+            print(" never happens at this place on this date (check the date/place or the shadow ratio)")
+        else:
+            print(c("2", " compare with a photo's EXIF time (osintkit exif) or use the shadow direction to check the claimed location"))
+
+
 # ---------------------------------------------------------------- menu / run
 # (command, description, [(prompt, flag or None for positional, default)])
 MENU = [
@@ -1663,16 +2466,28 @@ MENU = [
                                                      ("Range start:end (search)", "--range", "2025-01-01:2025-03-01")]),
     ("monitor", "Feed + Telegram keyword monitor", [("RSS/Atom feed URL", "--feed", ""), ("Telegram channel", "--tg", ""),
                                                     ("Keyword", "--kw", "")]),
+    ("email", "Email OSINT: provider, disposable?, Gravatar, reputation", [("Email address", None, "")]),
+    ("gituser", "GitHub recon: repos, leaked commit emails, active hours", [("GitHub username", None, "")]),
+    ("subdomains", "Passive subdomain discovery (6 sources) + live check", [("Domain", None, "")]),
+    ("pdns", "Passive DNS: IP history, reverse IP, threat pulses", [("Domain or IP", None, "")]),
+    ("oldurls", "Wayback URL mining: old admin/backup/API paths", [("Domain", None, "")]),
+    ("web", "Web recon: redirects, tech, cookies, robots, favicon hash", [("URL", None, "")]),
+    ("asn", "BGP/ASN intel: prefixes, upstreams, abuse contact", [("ASN, IP or domain", None, "")]),
+    ("phish", "Phishing URL check: live feeds + heuristics", [("URL or domain", None, "")]),
+    ("crypto", "BTC/ETH address lookup + OFAC sanctions check", [("Address", None, "")]),
+    ("geo", "Geocode + sun/shadow calculator (photo geolocation)", [("Place or lat,lon", None, ""),
+                                                                    ("Date/time UTC, e.g. 2026-06-21T14:30", "--at", ""),
+                                                                    ("Shadow/height ratio", "--shadow", "")]),
     ("setup", "Guided API key setup", []),
     ("doctor", "Which tools are ready", []),
 ]
 MENU_BY = {m[0]: m for m in MENU}
 CATS = [
-    ("Email & identity", ["headers", "username", "factcheck"]),
-    ("Domains & network", ["domain", "typosquat", "tls", "ip", "exposure", "brand"]),
-    ("Threat intel", ["ioc", "cve"]),
+    ("Email & identity", ["headers", "email", "username", "gituser", "factcheck"]),
+    ("Domains & network", ["domain", "subdomains", "pdns", "oldurls", "web", "typosquat", "tls", "ip", "asn", "exposure", "brand"]),
+    ("Threat intel", ["ioc", "cve", "phish", "crypto"]),
     ("Records & media", ["company", "wayback", "meta", "exif"]),
-    ("Tracking & imagery", ["fly", "vessel", "sat"]),
+    ("Tracking & imagery", ["fly", "vessel", "sat", "geo"]),
     ("Monitoring", ["monitor"]),
     ("Setup", ["setup", "doctor"]),
 ]
@@ -1728,7 +2543,7 @@ def show_menu():
         _print("\n " + c("1;35", title.upper()))
         for cmd in cmds:
             n += 1
-            _print(f"  {c('1;36', f'{n:>2}')}  {_status(cmd)} {c('1', cmd.ljust(10))} {c('2', MENU_BY[cmd][1])}")
+            _print(f"  {c('1;36', f'{n:>2}')}  {_status(cmd)} {c('1', cmd.ljust(11))} {c('2', MENU_BY[cmd][1])}")
     _print(c("2", "\n  ● ready   ○ works, more sources with API keys (run: setup)"))
 
 
@@ -1824,7 +2639,7 @@ def menu():
 
 def build_parser():
     p = argparse.ArgumentParser(prog="osintkit", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--version", action="version", version="osintkit 1.2.0")
+    p.add_argument("--version", action="version", version="osintkit 1.3.0")
     p.add_argument("--no-color", action="store_true", help="plain output without colors")
     p.add_argument("--save", metavar="FILE", help="also write the output to FILE (put before the command)")
     s = p.add_subparsers(dest="cmd", required=True)
@@ -1896,6 +2711,39 @@ def build_parser():
 
     x = s.add_parser("ip", help="IP location, network owner, Tor check"); x.add_argument("target", help="IP or domain")
     x.set_defaults(fn=cmd_ip)
+
+    x = s.add_parser("subdomains", help="passive subdomain discovery + live check"); x.add_argument("domain")
+    x.add_argument("--max", type=int, default=60, help="max hosts to list"); x.add_argument("--max-resolve", type=int, default=250)
+    x.add_argument("--no-resolve", action="store_true", help="skip the live DNS check"); x.set_defaults(fn=cmd_subdomains)
+
+    x = s.add_parser("phish", help="phishing URL check (feeds + heuristics)"); x.add_argument("target", help="URL or domain")
+    x.set_defaults(fn=cmd_phish)
+
+    x = s.add_parser("email", help="email address OSINT"); x.add_argument("address"); x.set_defaults(fn=cmd_email)
+
+    x = s.add_parser("asn", help="BGP / ASN intelligence"); x.add_argument("target", help="AS number, IP or domain")
+    x.add_argument("--max", type=int, default=15, help="max prefixes to list"); x.set_defaults(fn=cmd_asn)
+
+    x = s.add_parser("pdns", help="passive DNS history / reverse IP"); x.add_argument("target", help="domain or IP")
+    x.add_argument("--max", type=int, default=25); x.set_defaults(fn=cmd_pdns)
+
+    x = s.add_parser("gituser", help="GitHub user/org recon"); x.add_argument("name"); x.set_defaults(fn=cmd_gituser)
+
+    x = s.add_parser("oldurls", help="mine archived URLs for old admin/backup/API paths"); x.add_argument("domain")
+    x.add_argument("--limit", type=int, default=3000, help="max archived URLs to fetch")
+    x.add_argument("--show", type=int, default=6, help="examples per category"); x.set_defaults(fn=cmd_oldurls)
+
+    x = s.add_parser("web", help="web recon: redirects, tech, cookies, robots, favicon hash"); x.add_argument("url")
+    x.set_defaults(fn=cmd_web)
+
+    x = s.add_parser("crypto", help="Bitcoin / Ethereum address lookup + OFAC check"); x.add_argument("address")
+    x.set_defaults(fn=cmd_crypto)
+
+    x = s.add_parser("geo", help="geocode + sun/shadow calculator"); x.add_argument("query", help="place name or lat,lon")
+    x.add_argument("--at", metavar="ISO_UTC", help="e.g. 2026-06-21T14:30 (UTC), default now")
+    x.add_argument("--shadow", type=float, metavar="RATIO", help="observed shadow length / object height")
+    x.add_argument("--pick", type=int, default=1, help="which place match to use (default 1)")
+    x.set_defaults(fn=cmd_geo)
 
     x = s.add_parser("setup", help="guided API key setup")
     x.add_argument("--quick", action="store_true", help="just the 5 recommended free keys")

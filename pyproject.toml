@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "osintkit"
-version = "1.2.0"
-description = "Stdlib-only CLI bundling 19 open-source-intelligence tools with an interactive menu"
+version = "1.3.0"
+description = "Stdlib-only CLI bundling 29 open-source-intelligence tools with an interactive menu"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = []
